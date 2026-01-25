@@ -1,0 +1,17 @@
+[package]
+name = "grove"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Manage a grove of git repositories with per-project environment variables and centralized worktree management"
+
+[[bin]]
+name = "grove"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+
+[lints]
+workspace = true
