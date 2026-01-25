@@ -139,15 +139,8 @@ impl EnvVars {
 }
 
 fn shell_escape(s: &str) -> String {
-    // Characters that are safe unquoted in shell
-    if s.chars().all(|c| {
-        c.is_alphanumeric()
-            || matches!(c, '_' | '-' | '/' | '.' | ':' | '=' | '@' | '%' | '+' | ',')
-    }) {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\"'\"'"))
-    }
+    // Always quote for consistency and safety
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]
@@ -156,8 +149,8 @@ mod tests {
 
     #[test]
     fn test_shell_escape_simple() {
-        assert_eq!(shell_escape("hello"), "hello");
-        assert_eq!(shell_escape("/path/to/thing"), "/path/to/thing");
+        assert_eq!(shell_escape("hello"), "'hello'");
+        assert_eq!(shell_escape("/path/to/thing"), "'/path/to/thing'");
     }
 
     #[test]

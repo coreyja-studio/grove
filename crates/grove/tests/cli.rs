@@ -243,8 +243,8 @@ fn test_env_export() {
         .args(["env", "export", repo_path.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("export BAZ=qux"))
-        .stdout(predicate::str::contains("export FOO=bar"));
+        .stdout(predicate::str::contains("export BAZ='qux'"))
+        .stdout(predicate::str::contains("export FOO='bar'"));
 }
 
 #[test]
@@ -272,7 +272,7 @@ fn test_env_export_subdirectory() {
         .args(["env", "export", subdir.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("export KEY=value"));
+        .stdout(predicate::str::contains("export KEY='value'"));
 }
 
 #[test]
@@ -361,17 +361,17 @@ mod e2e {
             .assert()
             .success()
             .stdout(predicate::str::contains(
-                "export DATABASE_URL=postgres:///mydb",
+                "export DATABASE_URL='postgres:///mydb'",
             ))
-            .stdout(predicate::str::contains("export RUST_LOG=debug"))
-            .stdout(predicate::str::contains("export API_KEY=secret123"));
+            .stdout(predicate::str::contains("export RUST_LOG='debug'"))
+            .stdout(predicate::str::contains("export API_KEY='secret123'"));
 
         // Export from src subdirectory
         grove_cmd(&config_dir)
             .args(["env", "export", repo_path.join("src").to_str().unwrap()])
             .assert()
             .success()
-            .stdout(predicate::str::contains("export DATABASE_URL="));
+            .stdout(predicate::str::contains("export DATABASE_URL='"));
 
         // Update an existing env var
         grove_cmd(&config_dir)
@@ -455,15 +455,15 @@ mod e2e {
             .args(["env", "export", frontend.to_str().unwrap()])
             .assert()
             .success()
-            .stdout(predicate::str::contains("export PORT=3000"));
+            .stdout(predicate::str::contains("export PORT='3000'"));
 
         grove_cmd(&config_dir)
             .args(["env", "export", backend.to_str().unwrap()])
             .assert()
             .success()
-            .stdout(predicate::str::contains("export PORT=8080"))
+            .stdout(predicate::str::contains("export PORT='8080'"))
             .stdout(predicate::str::contains(
-                "export DATABASE_URL=postgres:///backend",
+                "export DATABASE_URL='postgres:///backend'",
             ));
 
         // Shared has no env vars
@@ -502,7 +502,7 @@ mod e2e {
             .args(["env", "export", deep_path.to_str().unwrap()])
             .assert()
             .success()
-            .stdout(predicate::str::contains("export NODE_ENV=development"));
+            .stdout(predicate::str::contains("export NODE_ENV='development'"));
     }
 
     /// E2E test: Values with special characters
