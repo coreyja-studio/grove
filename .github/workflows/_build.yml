@@ -1,0 +1,42 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        required: true
+        type: string
+      os:
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ inputs.target }}
+    runs-on: ${{ inputs.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ inputs.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ inputs.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          cd target/${{ inputs.target }}/release
+          tar czvf ../../../grove-${{ inputs.target }}.tar.gz grove
+          cd ../../..
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grove-${{ inputs.target }}
+          path: grove-${{ inputs.target }}.tar.gz

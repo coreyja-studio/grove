@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fmt:
+    uses: ./.github/workflows/_fmt.yml
+
+  clippy:
+    uses: ./.github/workflows/_clippy.yml
+
+  test:
+    uses: ./.github/workflows/_test.yml
+
+  build-linux:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [fmt, clippy, test]
+    uses: ./.github/workflows/_build.yml
+    with:
+      target: x86_64-unknown-linux-gnu
+      os: ubuntu-latest
+
+  build-macos-x86:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [fmt, clippy, test]
+    uses: ./.github/workflows/_build.yml
+    with:
+      target: x86_64-apple-darwin
+      os: macos-latest
+
+  build-macos-arm:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [fmt, clippy, test]
+    uses: ./.github/workflows/_build.yml
+    with:
+      target: aarch64-apple-darwin
+      os: macos-latest
+
+  release:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    name: Create Release
+    needs: [build-linux, build-macos-x86, build-macos-arm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "grove") | .version')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          mv artifacts/*/*.tar.gz release/
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          files: release/*
+          generate_release_notes: true
+          make_latest: true
