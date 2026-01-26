@@ -25,6 +25,21 @@ pub enum Error {
     #[error("Invalid KEY=value format: {0}")]
     InvalidEnvFormat(String),
 
+    #[error("Git command failed: {0}")]
+    GitCommandFailed(String),
+
+    #[error("Worktree path already exists: {0}")]
+    WorktreePathExists(PathBuf),
+
+    #[error("Worktree '{0}' not found")]
+    WorktreeNotFound(String),
+
+    #[error("Invalid worktree name '{0}': must contain only alphanumeric characters, hyphens, and underscores")]
+    InvalidWorktreeName(String),
+
+    #[error("Ambiguous worktree name '{0}', could match: {1}")]
+    AmbiguousWorktreeName(String, String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

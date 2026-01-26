@@ -15,6 +15,80 @@ pub struct Config {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Project {
     pub path: PathBuf,
+    #[serde(default)]
+    pub worktree_base: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+}
+
+impl Project {
+    /// Get the worktree base directory for this project.
+    /// Returns the configured `worktree_base`, or defaults to `<project_path>/.worktrees`.
+    pub fn worktree_base(&self) -> PathBuf {
+        self.worktree_base
+            .clone()
+            .unwrap_or_else(|| self.path.join(".worktrees"))
+    }
+
+    /// List all worktrees for this project by running `git worktree list --porcelain`.
+    /// Returns only secondary worktrees, not the main working directory.
+    pub fn list_worktrees(&self) -> Result<Vec<Worktree>> {
+        // Check if .git/worktrees exists - if not, no worktrees
+        if !self.path.join(".git/worktrees").exists() {
+            return Ok(Vec::new());
+        }
+
+        let output = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&self.path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(Error::GitCommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut worktrees = Vec::new();
+        let mut current_path: Option<PathBuf> = None;
+        let mut current_branch: Option<String> = None;
+        let mut is_first = true;
+
+        for line in stdout.lines() {
+            if let Some(path_str) = line.strip_prefix("worktree ") {
+                // Save previous worktree if any (skip first which is main repo)
+                if let Some(path) = current_path.take() {
+                    if !is_first {
+                        worktrees.push(Worktree {
+                            path,
+                            branch: current_branch.take(),
+                        });
+                    }
+                    is_first = false;
+                }
+                current_path = Some(PathBuf::from(path_str));
+                current_branch = None;
+            } else if let Some(branch_ref) = line.strip_prefix("branch refs/heads/") {
+                current_branch = Some(branch_ref.to_string());
+            }
+        }
+        // Don't forget the last worktree
+        if let Some(path) = current_path {
+            if !is_first {
+                worktrees.push(Worktree {
+                    path,
+                    branch: current_branch,
+                });
+            }
+        }
+
+        Ok(worktrees)
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -80,7 +154,13 @@ impl Config {
         }
 
         let canonical = path.canonicalize()?;
-        self.projects.insert(name, Project { path: canonical });
+        self.projects.insert(
+            name,
+            Project {
+                path: canonical,
+                worktree_base: None,
+            },
+        );
         Ok(())
     }
 
@@ -91,15 +171,31 @@ impl Config {
         Ok(())
     }
 
-    /// Find which project a path belongs to (exact match or subdirectory)
+    /// Find which project a path belongs to.
+    ///
+    /// Checks in order:
+    /// 1. Path is a subdirectory of a project's main repo
+    /// 2. Path is a subdirectory of one of the project's worktrees
     pub fn find_project_for_path(&self, path: &Path) -> Result<Option<String>> {
         let canonical = path.canonicalize()?;
 
+        // First: check if path is in a project's main repo
         for (name, project) in &self.projects {
             if canonical.starts_with(&project.path) {
                 return Ok(Some(name.clone()));
             }
         }
+
+        // Second: check if path is in any project's worktree
+        for (name, project) in &self.projects {
+            let worktrees = project.list_worktrees()?;
+            for wt in worktrees {
+                if canonical.starts_with(&wt.path) {
+                    return Ok(Some(name.clone()));
+                }
+            }
+        }
+
         Ok(None)
     }
 }
