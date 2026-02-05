@@ -40,6 +40,12 @@ pub enum Error {
     #[error("Ambiguous worktree name '{0}', could match: {1}")]
     AmbiguousWorktreeName(String, String),
 
+    #[error("Invalid project reference '{0}': expected 'project' or 'project/worktree'")]
+    InvalidProjectRef(String),
+
+    #[error("Worktree '{1}' not found in project '{0}'")]
+    WorktreeEnvNotFound(String, String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

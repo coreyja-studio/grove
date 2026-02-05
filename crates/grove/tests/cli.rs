@@ -1100,3 +1100,374 @@ mod worktree {
             .stdout(predicate::str::contains("No worktrees found"));
     }
 }
+
+// =============================================================================
+// Worktree environment override tests
+// =============================================================================
+
+mod worktree_env {
+    use super::*;
+
+    #[test]
+    fn test_env_set_worktree_override() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Create worktree
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "discord"])
+            .assert()
+            .success();
+
+        // Set worktree override
+        grove_cmd(&config_dir)
+            .args([
+                "env",
+                "set",
+                "myproject/discord",
+                "DATABASE_URL=postgres:///test",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Set DATABASE_URL"))
+            .stdout(predicate::str::contains("myproject/discord"));
+
+        // Verify the override file was created
+        let override_path = config_dir.path().join("envs/myproject/discord.toml");
+        assert!(
+            override_path.exists(),
+            "Worktree override file should exist"
+        );
+
+        let content = fs::read_to_string(&override_path).unwrap();
+        assert!(content.contains("DATABASE_URL"));
+    }
+
+    #[test]
+    fn test_env_list_worktree_merged() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Set project-level var
+        grove_cmd(&config_dir)
+            .args(["env", "set", "myproject", "RUST_LOG=debug"])
+            .assert()
+            .success();
+
+        // Set project-level var that will be overridden
+        grove_cmd(&config_dir)
+            .args([
+                "env",
+                "set",
+                "myproject",
+                "DATABASE_URL=postgres:///default",
+            ])
+            .assert()
+            .success();
+
+        // Create worktree
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "discord"])
+            .assert()
+            .success();
+
+        // Set worktree override for DATABASE_URL
+        grove_cmd(&config_dir)
+            .args([
+                "env",
+                "set",
+                "myproject/discord",
+                "DATABASE_URL=postgres:///test",
+            ])
+            .assert()
+            .success();
+
+        // List worktree env - should show merged with indicators
+        let output = grove_cmd(&config_dir)
+            .args(["env", "list", "myproject/discord"])
+            .assert()
+            .success();
+
+        output
+            .stdout(predicate::str::contains("DATABASE_URL"))
+            .stdout(predicate::str::contains("postgres:///test"))
+            .stdout(predicate::str::contains("(override)"))
+            .stdout(predicate::str::contains("RUST_LOG"))
+            .stdout(predicate::str::contains("(from project)"));
+    }
+
+    #[test]
+    fn test_env_list_project_backward_compatible() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo_path = create_fake_git_repo(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo_path.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["env", "set", "myproject", "DATABASE_URL=postgres:///test"])
+            .assert()
+            .success();
+
+        // Project-level list should still use KEY=value format (no annotations)
+        grove_cmd(&config_dir)
+            .args(["env", "list", "myproject"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("DATABASE_URL=postgres:///test"));
+    }
+
+    #[test]
+    fn test_env_export_worktree_override() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Set project-level vars
+        grove_cmd(&config_dir)
+            .args([
+                "env",
+                "set",
+                "myproject",
+                "DATABASE_URL=postgres:///default",
+            ])
+            .assert()
+            .success();
+        grove_cmd(&config_dir)
+            .args(["env", "set", "myproject", "RUST_LOG=debug"])
+            .assert()
+            .success();
+
+        // Create worktree
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "discord"])
+            .assert()
+            .success();
+
+        // Set worktree override
+        grove_cmd(&config_dir)
+            .args([
+                "env",
+                "set",
+                "myproject/discord",
+                "DATABASE_URL=postgres:///test",
+            ])
+            .assert()
+            .success();
+
+        let worktree_path = repo.join(".worktrees/discord");
+
+        // Export from worktree path should return overridden value
+        grove_cmd(&config_dir)
+            .args(["env", "export", worktree_path.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "export DATABASE_URL='postgres:///test'",
+            ))
+            .stdout(predicate::str::contains("export RUST_LOG='debug'"));
+
+        // Export from main repo path should still return project default
+        grove_cmd(&config_dir)
+            .args(["env", "export", repo.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "export DATABASE_URL='postgres:///default'",
+            ));
+    }
+
+    #[test]
+    fn test_env_unset_worktree() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "discord"])
+            .assert()
+            .success();
+
+        // Set two worktree overrides
+        grove_cmd(&config_dir)
+            .args([
+                "env",
+                "set",
+                "myproject/discord",
+                "DATABASE_URL=postgres:///test",
+            ])
+            .assert()
+            .success();
+        grove_cmd(&config_dir)
+            .args(["env", "set", "myproject/discord", "EXTRA=value"])
+            .assert()
+            .success();
+
+        // Unset one key
+        grove_cmd(&config_dir)
+            .args(["env", "unset", "myproject/discord", "DATABASE_URL"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Unset DATABASE_URL"));
+
+        // Override file should still exist (still has EXTRA)
+        let override_path = config_dir.path().join("envs/myproject/discord.toml");
+        assert!(override_path.exists());
+    }
+
+    #[test]
+    fn test_env_unset_worktree_last_key_removes_file() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "discord"])
+            .assert()
+            .success();
+
+        // Set one worktree override
+        grove_cmd(&config_dir)
+            .args([
+                "env",
+                "set",
+                "myproject/discord",
+                "DATABASE_URL=postgres:///test",
+            ])
+            .assert()
+            .success();
+
+        let override_path = config_dir.path().join("envs/myproject/discord.toml");
+        assert!(override_path.exists());
+
+        // Unset the only key
+        grove_cmd(&config_dir)
+            .args(["env", "unset", "myproject/discord", "DATABASE_URL"])
+            .assert()
+            .success();
+
+        // Override file should be deleted
+        assert!(
+            !override_path.exists(),
+            "Override file should be deleted when last key removed"
+        );
+    }
+
+    #[test]
+    fn test_env_unset_project_last_key_removes_file() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo_path = create_fake_git_repo(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo_path.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["env", "set", "myproject", "FOO=bar"])
+            .assert()
+            .success();
+
+        let env_path = config_dir.path().join("envs/myproject.toml");
+        assert!(env_path.exists());
+
+        // Unset the only key
+        grove_cmd(&config_dir)
+            .args(["env", "unset", "myproject", "FOO"])
+            .assert()
+            .success();
+
+        // Env file should be deleted
+        assert!(
+            !env_path.exists(),
+            "Env file should be deleted when last key removed"
+        );
+    }
+
+    #[test]
+    fn test_env_list_worktree_empty() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "discord"])
+            .assert()
+            .success();
+
+        // List worktree env with no vars set
+        grove_cmd(&config_dir)
+            .args(["env", "list", "myproject/discord"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "No environment variables set for 'myproject/discord'",
+            ));
+    }
+
+    #[test]
+    fn test_env_set_worktree_not_found() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo_path = create_fake_git_repo(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo_path.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Try to set env on nonexistent worktree
+        grove_cmd(&config_dir)
+            .args([
+                "env",
+                "set",
+                "myproject/nonexistent",
+                "DATABASE_URL=postgres:///test",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("not found"));
+    }
+}

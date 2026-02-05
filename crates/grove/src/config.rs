@@ -6,6 +6,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+#[derive(Debug)]
+pub struct ProjectRef {
+    pub project: String,
+    pub worktree: Option<String>,
+}
+
+impl ProjectRef {
+    pub fn parse(input: &str) -> Result<Self> {
+        let parts: Vec<&str> = input.split('/').collect();
+        match parts.as_slice() {
+            [project] if !project.is_empty() => Ok(Self {
+                project: (*project).to_string(),
+                worktree: None,
+            }),
+            [project, worktree] if !project.is_empty() && !worktree.is_empty() => Ok(Self {
+                project: (*project).to_string(),
+                worktree: Some((*worktree).to_string()),
+            }),
+            _ => Err(Error::InvalidProjectRef(input.to_string())),
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -115,8 +138,12 @@ fn envs_dir() -> Result<PathBuf> {
     Ok(config_dir()?.join("envs"))
 }
 
-fn env_path(project: &str) -> Result<PathBuf> {
+pub(crate) fn env_path(project: &str) -> Result<PathBuf> {
     Ok(envs_dir()?.join(format!("{project}.toml")))
+}
+
+pub(crate) fn worktree_env_path(project: &str, worktree: &str) -> Result<PathBuf> {
+    Ok(envs_dir()?.join(project).join(format!("{worktree}.toml")))
 }
 
 impl Config {
@@ -174,25 +201,36 @@ impl Config {
     /// Find which project a path belongs to.
     ///
     /// Checks in order:
-    /// 1. Path is a subdirectory of a project's main repo
-    /// 2. Path is a subdirectory of one of the project's worktrees
-    pub fn find_project_for_path(&self, path: &Path) -> Result<Option<String>> {
+    /// 1. Path is a subdirectory of one of the project's worktrees (more specific match)
+    /// 2. Path is a subdirectory of a project's main repo
+    pub fn find_project_for_path(&self, path: &Path) -> Result<Option<ProjectRef>> {
         let canonical = path.canonicalize()?;
 
-        // First: check if path is in a project's main repo
-        for (name, project) in &self.projects {
-            if canonical.starts_with(&project.path) {
-                return Ok(Some(name.clone()));
-            }
-        }
-
-        // Second: check if path is in any project's worktree
+        // First: check if path is in any project's worktree (more specific match)
         for (name, project) in &self.projects {
             let worktrees = project.list_worktrees()?;
             for wt in worktrees {
                 if canonical.starts_with(&wt.path) {
-                    return Ok(Some(name.clone()));
+                    let worktree_dir_name =
+                        wt.path.file_name().map(|n| n.to_string_lossy().to_string());
+                    let Some(wt_name) = worktree_dir_name else {
+                        continue;
+                    };
+                    return Ok(Some(ProjectRef {
+                        project: name.clone(),
+                        worktree: Some(wt_name),
+                    }));
                 }
+            }
+        }
+
+        // Second: check if path is in a project's main repo
+        for (name, project) in &self.projects {
+            if canonical.starts_with(&project.path) {
+                return Ok(Some(ProjectRef {
+                    project: name.clone(),
+                    worktree: None,
+                }));
             }
         }
 
@@ -221,17 +259,75 @@ impl EnvVars {
         Ok(())
     }
 
+    pub fn load_worktree(project: &str, worktree: &str) -> Result<Self> {
+        let path = worktree_env_path(project, worktree)?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = fs::read_to_string(&path)?;
+        let vars: Self = toml::from_str(&content)?;
+        Ok(vars)
+    }
+
+    pub fn save_worktree(&self, project: &str, worktree: &str) -> Result<()> {
+        let path = worktree_env_path(project, worktree)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string_pretty(self)?;
+        fs::write(&path, content)?;
+        Ok(())
+    }
+
     pub fn set(&mut self, key: String, value: String) {
         self.vars.insert(key, value);
     }
 
-    pub fn export(&self) -> String {
-        self.vars
-            .iter()
-            .map(|(k, v)| format!("export {k}={}", shell_escape(v)))
-            .collect::<Vec<_>>()
-            .join("\n")
+    pub fn remove(&mut self, key: &str) -> bool {
+        self.vars.remove(key).is_some()
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum EnvSource {
+    Project,
+    Worktree,
+}
+
+#[derive(Debug)]
+pub struct MergedEnvVar {
+    pub key: String,
+    pub value: String,
+    pub source: EnvSource,
+}
+
+pub fn load_merged_env(project_ref: &ProjectRef) -> Result<Vec<MergedEnvVar>> {
+    let base = EnvVars::load(&project_ref.project)?;
+
+    let mut merged: BTreeMap<String, (String, EnvSource)> = base
+        .vars
+        .into_iter()
+        .map(|(k, v)| (k, (v, EnvSource::Project)))
+        .collect();
+
+    if let Some(wt) = &project_ref.worktree {
+        let overrides = EnvVars::load_worktree(&project_ref.project, wt)?;
+        for (k, v) in overrides.vars {
+            merged.insert(k, (v, EnvSource::Worktree));
+        }
+    }
+
+    Ok(merged
+        .into_iter()
+        .map(|(key, (value, source))| MergedEnvVar { key, value, source })
+        .collect())
+}
+
+pub fn export_merged_env(vars: &[MergedEnvVar]) -> String {
+    vars.iter()
+        .map(|var| format!("export {}={}", var.key, shell_escape(&var.value)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn shell_escape(s: &str) -> String {
@@ -253,5 +349,39 @@ mod tests {
     fn test_shell_escape_special() {
         assert_eq!(shell_escape("hello world"), "'hello world'");
         assert_eq!(shell_escape("it's"), "'it'\"'\"'s'");
+    }
+
+    #[test]
+    fn test_project_ref_parse_project_only() {
+        let pr = ProjectRef::parse("mull").unwrap();
+        assert_eq!(pr.project, "mull");
+        assert!(pr.worktree.is_none());
+    }
+
+    #[test]
+    fn test_project_ref_parse_with_worktree() {
+        let pr = ProjectRef::parse("mull/discord").unwrap();
+        assert_eq!(pr.project, "mull");
+        assert_eq!(pr.worktree.as_deref(), Some("discord"));
+    }
+
+    #[test]
+    fn test_project_ref_parse_too_many_parts() {
+        assert!(ProjectRef::parse("mull/discord/extra").is_err());
+    }
+
+    #[test]
+    fn test_project_ref_parse_leading_slash() {
+        assert!(ProjectRef::parse("/discord").is_err());
+    }
+
+    #[test]
+    fn test_project_ref_parse_trailing_slash() {
+        assert!(ProjectRef::parse("mull/").is_err());
+    }
+
+    #[test]
+    fn test_project_ref_parse_empty() {
+        assert!(ProjectRef::parse("").is_err());
     }
 }
