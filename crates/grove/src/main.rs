@@ -5,7 +5,7 @@ use clap::Parser;
 mod config;
 mod error;
 
-use config::{Config, EnvVars};
+use config::{Config, EnvVars, ProjectRef};
 use error::{Error, Result};
 
 #[derive(Parser)]
@@ -45,17 +45,24 @@ enum Commands {
 
 #[derive(clap::Subcommand)]
 enum EnvCommands {
-    /// Set a project-level environment variable
+    /// Set an environment variable
     Set {
-        /// Project name
+        /// Project name or project/worktree
         project: String,
         /// KEY=value pair
         pair: String,
     },
-    /// Show all environment variables for a project
+    /// Show all environment variables
     List {
-        /// Project name
+        /// Project name or project/worktree
         project: String,
+    },
+    /// Remove an environment variable
+    Unset {
+        /// Project name or project/worktree
+        project: String,
+        /// Environment variable key to remove
+        key: String,
     },
     /// Output environment variables for the project containing a path
     Export {
@@ -102,6 +109,7 @@ fn run(command: Commands) -> Result<()> {
         Commands::Env { command } => match command {
             EnvCommands::Set { project, pair } => cmd_env_set(&project, &pair),
             EnvCommands::List { project } => cmd_env_list(&project),
+            EnvCommands::Unset { project, key } => cmd_env_unset(&project, &key),
             EnvCommands::Export { path } => cmd_env_export(path),
         },
         Commands::Worktree { command } => match command {
@@ -141,51 +149,161 @@ fn cmd_remove(name: &str) -> Result<()> {
 }
 
 fn cmd_env_set(project: &str, pair: &str) -> Result<()> {
-    // Validate project exists
+    let project_ref = ProjectRef::parse(project)?;
+
     let config = Config::load()?;
-    if !config.projects.contains_key(project) {
-        return Err(Error::ProjectNotFound(project.to_string()));
-    }
+    let proj = config
+        .projects
+        .get(&project_ref.project)
+        .ok_or_else(|| Error::ProjectNotFound(project_ref.project.clone()))?;
 
     let (key, value) = pair
         .split_once('=')
         .ok_or_else(|| Error::InvalidEnvFormat(pair.to_string()))?;
 
-    let mut vars = EnvVars::load(project)?;
-    vars.set(key.to_string(), value.to_string());
-    vars.save(project)?;
-    println!("Set {key} for project '{project}'");
+    if let Some(wt_name) = &project_ref.worktree {
+        validate_worktree_exists(proj, &project_ref.project, wt_name)?;
+
+        let mut vars = EnvVars::load_worktree(&project_ref.project, wt_name)?;
+        vars.set(key.to_string(), value.to_string());
+        vars.save_worktree(&project_ref.project, wt_name)?;
+        println!("Set {key} for worktree '{project}'");
+    } else {
+        let mut vars = EnvVars::load(&project_ref.project)?;
+        vars.set(key.to_string(), value.to_string());
+        vars.save(&project_ref.project)?;
+        println!("Set {key} for project '{}'", project_ref.project);
+    }
+
+    Ok(())
+}
+
+fn cmd_env_unset(project: &str, key: &str) -> Result<()> {
+    let project_ref = ProjectRef::parse(project)?;
+
+    let config = Config::load()?;
+    let proj = config
+        .projects
+        .get(&project_ref.project)
+        .ok_or_else(|| Error::ProjectNotFound(project_ref.project.clone()))?;
+
+    if let Some(wt_name) = &project_ref.worktree {
+        validate_worktree_exists(proj, &project_ref.project, wt_name)?;
+
+        let mut vars = EnvVars::load_worktree(&project_ref.project, wt_name)?;
+        if vars.remove(key) {
+            if vars.vars.is_empty() {
+                let path = config::worktree_env_path(&project_ref.project, wt_name)?;
+                if path.exists() {
+                    std::fs::remove_file(&path)?;
+                }
+            } else {
+                vars.save_worktree(&project_ref.project, wt_name)?;
+            }
+            println!("Unset {key} for worktree '{project}'");
+        } else {
+            println!("Key '{key}' not found in worktree '{project}'");
+        }
+    } else {
+        let mut vars = EnvVars::load(&project_ref.project)?;
+        if vars.remove(key) {
+            if vars.vars.is_empty() {
+                let path = config::env_path(&project_ref.project)?;
+                if path.exists() {
+                    std::fs::remove_file(&path)?;
+                }
+            } else {
+                vars.save(&project_ref.project)?;
+            }
+            println!("Unset {key} for project '{}'", project_ref.project);
+        } else {
+            println!("Key '{key}' not found in project '{}'", project_ref.project);
+        }
+    }
+
     Ok(())
 }
 
 fn cmd_env_list(project: &str) -> Result<()> {
-    // Validate project exists
+    let project_ref = ProjectRef::parse(project)?;
+
     let config = Config::load()?;
-    if !config.projects.contains_key(project) {
-        return Err(Error::ProjectNotFound(project.to_string()));
+    let proj = config
+        .projects
+        .get(&project_ref.project)
+        .ok_or_else(|| Error::ProjectNotFound(project_ref.project.clone()))?;
+
+    if let Some(wt_name) = &project_ref.worktree {
+        validate_worktree_exists(proj, &project_ref.project, wt_name)?;
+
+        let merged = config::load_merged_env(&project_ref)?;
+        if merged.is_empty() {
+            println!("No environment variables set for '{project}'");
+            return Ok(());
+        }
+
+        // Calculate max key length for alignment
+        let max_key_len = merged.iter().map(|v| v.key.len()).max().unwrap_or(0);
+
+        for var in &merged {
+            let source_label = match var.source {
+                config::EnvSource::Worktree => "(override)",
+                config::EnvSource::Project => "(from project)",
+            };
+            println!(
+                "{:width$} = {}  {}",
+                var.key,
+                var.value,
+                source_label,
+                width = max_key_len
+            );
+        }
+    } else {
+        // Project-only: use existing code path unchanged for backward compatibility
+        let vars = EnvVars::load(&project_ref.project)?;
+        if vars.vars.is_empty() {
+            println!("No environment variables set for '{}'", project_ref.project);
+            return Ok(());
+        }
+        for (key, value) in &vars.vars {
+            println!("{key}={value}");
+        }
     }
 
-    let vars = EnvVars::load(project)?;
-    if vars.vars.is_empty() {
-        println!("No environment variables set for '{project}'");
-        return Ok(());
-    }
-    for (key, value) in &vars.vars {
-        println!("{key}={value}");
-    }
     Ok(())
 }
 
 fn cmd_env_export(path: PathBuf) -> Result<()> {
     let config = Config::load()?;
-    let project = config
+    let project_ref = config
         .find_project_for_path(&path)?
         .ok_or(Error::NoProjectForPath(path))?;
 
-    let vars = EnvVars::load(&project)?;
-    let output = vars.export();
+    let merged = config::load_merged_env(&project_ref)?;
+    let output = config::export_merged_env(&merged);
     if !output.is_empty() {
         println!("{output}");
+    }
+    Ok(())
+}
+
+/// Validate that a worktree actually exists for a project.
+fn validate_worktree_exists(
+    project: &config::Project,
+    project_name: &str,
+    worktree_name: &str,
+) -> Result<()> {
+    let worktrees = project.list_worktrees()?;
+    let exists = worktrees.iter().any(|wt| {
+        wt.path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy() == worktree_name)
+    });
+    if !exists {
+        return Err(Error::WorktreeEnvNotFound(
+            project_name.to_string(),
+            worktree_name.to_string(),
+        ));
     }
     Ok(())
 }
