@@ -1471,3 +1471,212 @@ mod worktree_env {
             .stderr(predicate::str::contains("not found"));
     }
 }
+
+// =============================================================================
+// JSON export tests
+// =============================================================================
+
+mod json_export {
+    use super::*;
+
+    #[test]
+    fn test_env_export_json_registered_project() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo_path = create_fake_git_repo(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo_path.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["env", "set", "myproject", "DATABASE_URL=postgres:///test"])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["env", "set", "myproject", "API_KEY=secret"])
+            .assert()
+            .success();
+
+        // Export as JSON
+        grove_cmd(&config_dir)
+            .args(["env", "export", "--json", repo_path.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                r#"{"API_KEY":"secret","DATABASE_URL":"postgres:///test"}"#,
+            ));
+    }
+
+    #[test]
+    fn test_env_export_json_nonexistent_path() {
+        let config_dir = TempDir::new().unwrap();
+
+        grove_cmd(&config_dir)
+            .args(["env", "export", "--json", "/some/nonexistent/path"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("{}"));
+    }
+
+    #[test]
+    fn test_env_export_json_unregistered_path() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+
+        // An existing directory that isn't registered as a grove project
+        grove_cmd(&config_dir)
+            .args([
+                "env",
+                "export",
+                "--json",
+                repos_dir.path().to_str().unwrap(),
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("{}"));
+    }
+
+    #[test]
+    fn test_env_export_json_worktree_overrides() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Set project-level var
+        grove_cmd(&config_dir)
+            .args(["env", "set", "myproject", "DATABASE_URL=postgres:///prod"])
+            .assert()
+            .success();
+
+        // Create worktree and set override
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "feature"])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args([
+                "env",
+                "set",
+                "myproject/feature",
+                "DATABASE_URL=postgres:///dev",
+            ])
+            .assert()
+            .success();
+
+        let worktree_path = repo.join(".worktrees/feature");
+
+        // JSON export from worktree should show overridden value
+        grove_cmd(&config_dir)
+            .args(["env", "export", "--json", worktree_path.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                r#""DATABASE_URL":"postgres:///dev""#,
+            ));
+    }
+
+    #[test]
+    fn test_env_export_json_no_env_vars() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo_path = create_fake_git_repo(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo_path.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Don't set any env vars — JSON should return {}
+        grove_cmd(&config_dir)
+            .args(["env", "export", "--json", repo_path.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("{}"));
+    }
+
+    #[test]
+    fn test_env_export_without_json_unchanged() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+
+        // Non-JSON export of unregistered path should still error
+        grove_cmd(&config_dir)
+            .args(["env", "export", repos_dir.path().to_str().unwrap()])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "does not belong to any registered project",
+            ));
+    }
+}
+
+// =============================================================================
+// init-mise tests
+// =============================================================================
+
+mod init_mise {
+    use super::*;
+
+    #[test]
+    fn test_init_mise_creates_plugin_files() {
+        let config_dir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+
+        grove_cmd(&config_dir)
+            .arg("init-mise")
+            .env("MISE_DATA_DIR", data_dir.path())
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Installed grove plugin"))
+            .stdout(predicate::str::contains("~/.config/mise/config.toml"));
+
+        // Check metadata.lua
+        let metadata_path = data_dir.path().join("plugins/grove/metadata.lua");
+        assert!(metadata_path.exists(), "metadata.lua should exist");
+        let metadata = fs::read_to_string(&metadata_path).unwrap();
+        assert!(metadata.contains(r#"PLUGIN.name = "grove""#));
+
+        // Check hooks/mise_env.lua
+        let hook_path = data_dir.path().join("plugins/grove/hooks/mise_env.lua");
+        assert!(hook_path.exists(), "mise_env.lua should exist");
+        let hook = fs::read_to_string(&hook_path).unwrap();
+        assert!(hook.contains("MiseEnv"));
+        assert!(hook.contains(r#"require("cmd")"#));
+        assert!(hook.contains(r#"require("json")"#));
+    }
+
+    #[test]
+    fn test_init_mise_idempotent() {
+        let config_dir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+
+        // Run twice
+        grove_cmd(&config_dir)
+            .arg("init-mise")
+            .env("MISE_DATA_DIR", data_dir.path())
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .arg("init-mise")
+            .env("MISE_DATA_DIR", data_dir.path())
+            .assert()
+            .success();
+
+        // Files should exist and be valid after both runs
+        let metadata_path = data_dir.path().join("plugins/grove/metadata.lua");
+        assert!(metadata_path.exists());
+        let metadata = fs::read_to_string(&metadata_path).unwrap();
+        assert!(metadata.contains(r#"PLUGIN.name = "grove""#));
+    }
+}
