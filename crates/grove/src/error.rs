@@ -54,4 +54,10 @@ pub enum Error {
 
     #[error(transparent)]
     TomlSerialize(#[from] toml::ser::Error),
+
+    #[error(transparent)]
+    SerdeJson(#[from] serde_json::Error),
+
+    #[error("Could not determine data directory for mise plugin installation")]
+    NoDataDir,
 }

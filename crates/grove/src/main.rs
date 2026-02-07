@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -7,6 +8,9 @@ mod error;
 
 use config::{Config, EnvVars, ProjectRef};
 use error::{Error, Result};
+
+const MISE_METADATA_LUA: &str = include_str!("mise_plugin/metadata.lua");
+const MISE_ENV_LUA: &str = include_str!("mise_plugin/mise_env.lua");
 
 #[derive(Parser)]
 #[command(name = "grove", version, about = "Manage a grove of git repositories")]
@@ -41,6 +45,8 @@ enum Commands {
         #[command(subcommand)]
         command: WorktreeCommands,
     },
+    /// Install grove plugin for mise
+    InitMise,
 }
 
 #[derive(clap::Subcommand)]
@@ -66,6 +72,9 @@ enum EnvCommands {
     },
     /// Output environment variables for the project containing a path
     Export {
+        /// Output as JSON object
+        #[arg(long)]
+        json: bool,
         /// Directory path
         path: PathBuf,
     },
@@ -110,8 +119,9 @@ fn run(command: Commands) -> Result<()> {
             EnvCommands::Set { project, pair } => cmd_env_set(&project, &pair),
             EnvCommands::List { project } => cmd_env_list(&project),
             EnvCommands::Unset { project, key } => cmd_env_unset(&project, &key),
-            EnvCommands::Export { path } => cmd_env_export(path),
+            EnvCommands::Export { json, path } => cmd_env_export(path, json),
         },
+        Commands::InitMise => cmd_init_mise(),
         Commands::Worktree { command } => match command {
             WorktreeCommands::New { project, name } => cmd_worktree_new(&project, &name),
             WorktreeCommands::List { project } => cmd_worktree_list(project.as_deref()),
@@ -273,16 +283,34 @@ fn cmd_env_list(project: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_env_export(path: PathBuf) -> Result<()> {
-    let config = Config::load()?;
-    let project_ref = config
-        .find_project_for_path(&path)?
-        .ok_or(Error::NoProjectForPath(path))?;
+fn cmd_env_export(path: PathBuf, json: bool) -> Result<()> {
+    if json {
+        if !path.exists() {
+            println!("{{}}");
+            return Ok(());
+        }
 
-    let merged = config::load_merged_env(&project_ref)?;
-    let output = config::export_merged_env(&merged);
-    if !output.is_empty() {
-        println!("{output}");
+        let config = Config::load()?;
+        let Some(project_ref) = config.find_project_for_path(&path)? else {
+            println!("{{}}");
+            return Ok(());
+        };
+
+        let merged = config::load_merged_env(&project_ref)?;
+        let map: BTreeMap<String, String> = merged.into_iter().map(|v| (v.key, v.value)).collect();
+        let json_str = serde_json::to_string(&map)?;
+        println!("{json_str}");
+    } else {
+        let config = Config::load()?;
+        let project_ref = config
+            .find_project_for_path(&path)?
+            .ok_or(Error::NoProjectForPath(path))?;
+
+        let merged = config::load_merged_env(&project_ref)?;
+        let output = config::export_merged_env(&merged);
+        if !output.is_empty() {
+            println!("{output}");
+        }
     }
     Ok(())
 }
@@ -493,5 +521,37 @@ fn remove_worktree(project: &config::Project, worktree_path: &std::path::Path) -
     }
 
     println!("Removed worktree at {}", worktree_path.display());
+    Ok(())
+}
+
+fn mise_data_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("MISE_DATA_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(dir).join("mise"));
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".local/share/mise"))
+        .ok_or(Error::NoDataDir)
+}
+
+fn cmd_init_mise() -> Result<()> {
+    let plugin_dir = mise_data_dir()?.join("plugins/grove");
+    let hooks_dir = plugin_dir.join("hooks");
+
+    std::fs::create_dir_all(&hooks_dir)?;
+    std::fs::write(plugin_dir.join("metadata.lua"), MISE_METADATA_LUA)?;
+    std::fs::write(hooks_dir.join("mise_env.lua"), MISE_ENV_LUA)?;
+
+    println!("Installed grove plugin to {}", plugin_dir.display());
+    println!();
+    println!("Add the following to ~/.config/mise/config.toml:");
+    println!();
+    println!("[env]");
+    println!("_.grove = {{}}");
+    println!();
+    println!("If the file doesn't exist yet, create it first.");
+
     Ok(())
 }
