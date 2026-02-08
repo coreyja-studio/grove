@@ -1632,8 +1632,10 @@ mod database {
     use super::*;
 
     fn postgres_available() -> bool {
-        Command::new("createdb")
-            .arg("--version")
+        // Check that psql can actually connect, not just that the binary exists.
+        // On CI runners the binaries are installed but the server isn't running.
+        Command::new("psql")
+            .args(["-c", "SELECT 1"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
