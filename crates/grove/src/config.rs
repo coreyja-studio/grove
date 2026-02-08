@@ -35,11 +35,48 @@ pub struct Config {
     pub projects: BTreeMap<String, Project>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    pub url_template: String,
+    #[serde(default)]
+    pub setup_command: Option<String>,
+    #[serde(default)]
+    pub env_var: Option<String>,
+}
+
+impl DatabaseConfig {
+    #[allow(clippy::unused_self)]
+    pub fn db_name(&self, project: &str, worktree: &str) -> String {
+        let raw = format!("{project}_{worktree}");
+        raw.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+            .to_lowercase()
+    }
+
+    pub fn database_url(&self, project: &str, worktree: &str) -> String {
+        let db_name = self.db_name(project, worktree);
+        self.url_template.replace("{{db_name}}", &db_name)
+    }
+
+    pub fn env_var_name(&self) -> &str {
+        self.env_var.as_deref().unwrap_or("DATABASE_URL")
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Project {
     pub path: PathBuf,
     #[serde(default)]
     pub worktree_base: Option<PathBuf>,
+    #[serde(default)]
+    pub database: Option<DatabaseConfig>,
 }
 
 #[derive(Debug)]
@@ -186,6 +223,7 @@ impl Config {
             Project {
                 path: canonical,
                 worktree_base: None,
+                database: None,
             },
         );
         Ok(())
@@ -383,5 +421,133 @@ mod tests {
     #[test]
     fn test_project_ref_parse_empty() {
         assert!(ProjectRef::parse("").is_err());
+    }
+
+    #[test]
+    fn test_db_name_basic() {
+        let cfg = DatabaseConfig {
+            url_template: String::new(),
+            setup_command: None,
+            env_var: None,
+        };
+        assert_eq!(cfg.db_name("mull", "feature-auth"), "mull_feature_auth");
+        assert_eq!(
+            cfg.db_name("my-project", "add-users"),
+            "my_project_add_users"
+        );
+    }
+
+    #[test]
+    fn test_db_name_case_and_special_chars() {
+        let cfg = DatabaseConfig {
+            url_template: String::new(),
+            setup_command: None,
+            env_var: None,
+        };
+        assert_eq!(cfg.db_name("Mull", "Feature"), "mull_feature");
+        assert_eq!(cfg.db_name("my.project", "feat"), "my_project_feat");
+        assert_eq!(cfg.db_name("has spaces", "feat"), "has_spaces_feat");
+    }
+
+    #[test]
+    fn test_database_url_template() {
+        let cfg = DatabaseConfig {
+            url_template: "postgres:///{{db_name}}".to_string(),
+            setup_command: None,
+            env_var: None,
+        };
+        assert_eq!(
+            cfg.database_url("mull", "feature"),
+            "postgres:///mull_feature"
+        );
+
+        let cfg2 = DatabaseConfig {
+            url_template: "postgres://localhost:5432/{{db_name}}".to_string(),
+            setup_command: None,
+            env_var: None,
+        };
+        assert_eq!(
+            cfg2.database_url("mull", "feature"),
+            "postgres://localhost:5432/mull_feature"
+        );
+    }
+
+    #[test]
+    fn test_env_var_name_default() {
+        let cfg = DatabaseConfig {
+            url_template: String::new(),
+            setup_command: None,
+            env_var: None,
+        };
+        assert_eq!(cfg.env_var_name(), "DATABASE_URL");
+    }
+
+    #[test]
+    fn test_env_var_name_custom() {
+        let cfg = DatabaseConfig {
+            url_template: String::new(),
+            setup_command: None,
+            env_var: Some("DB_URL".to_string()),
+        };
+        assert_eq!(cfg.env_var_name(), "DB_URL");
+    }
+
+    #[test]
+    fn test_database_config_deserialization() {
+        let toml_str = r#"
+[projects.myproject]
+path = "/tmp/myproject"
+
+[projects.myproject.database]
+url_template = "postgres:///{{db_name}}"
+setup_command = "cargo sqlx database setup"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let project = config.projects.get("myproject").unwrap();
+        let db = project.database.as_ref().unwrap();
+        assert_eq!(db.url_template, "postgres:///{{db_name}}");
+        assert_eq!(
+            db.setup_command.as_deref(),
+            Some("cargo sqlx database setup")
+        );
+        assert!(db.env_var.is_none());
+    }
+
+    #[test]
+    fn test_database_config_absent_backward_compat() {
+        let toml_str = r#"
+[projects.myproject]
+path = "/tmp/myproject"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let project = config.projects.get("myproject").unwrap();
+        assert!(project.database.is_none());
+    }
+
+    #[test]
+    fn test_database_config_roundtrip() {
+        let db_config = DatabaseConfig {
+            url_template: "postgres:///{{db_name}}".to_string(),
+            setup_command: Some("cargo sqlx database setup".to_string()),
+            env_var: Some("DB_URL".to_string()),
+        };
+        let config = Config {
+            projects: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "myproject".to_string(),
+                    Project {
+                        path: PathBuf::from("/tmp/myproject"),
+                        worktree_base: None,
+                        database: Some(db_config.clone()),
+                    },
+                );
+                m
+            },
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        let project = deserialized.projects.get("myproject").unwrap();
+        assert_eq!(project.database.as_ref(), Some(&db_config));
     }
 }
