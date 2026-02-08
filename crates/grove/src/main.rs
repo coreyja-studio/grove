@@ -348,6 +348,55 @@ fn validate_worktree_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn create_database(db_name: &str) -> Result<()> {
+    let output = std::process::Command::new("createdb")
+        .arg(db_name)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(Error::DatabaseCreationFailed(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn drop_database(db_name: &str) -> Result<()> {
+    let output = std::process::Command::new("dropdb")
+        .args(["--if-exists", db_name])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(Error::DatabaseDropFailed(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn run_setup_command(
+    command: &str,
+    worktree_path: &std::path::Path,
+    env_var_name: &str,
+    database_url: &str,
+) -> Result<()> {
+    let output = std::process::Command::new("sh")
+        .args(["-c", command])
+        .current_dir(worktree_path)
+        .env(env_var_name, database_url)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(Error::SetupCommandFailed(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn cmd_worktree_new(project_name: &str, worktree_name: &str) -> Result<()> {
     validate_worktree_name(worktree_name)?;
 
@@ -406,6 +455,28 @@ fn cmd_worktree_new(project_name: &str, worktree_name: &str) -> Result<()> {
     }
 
     println!("Created worktree at {}", worktree_path.display());
+
+    if let Some(db_config) = &project.database {
+        let db_name = db_config.db_name(project_name, worktree_name);
+        println!("Creating database '{db_name}'...");
+        create_database(&db_name)?;
+        println!("Created database '{db_name}'");
+
+        let db_url = db_config.database_url(project_name, worktree_name);
+        let env_var = db_config.env_var_name();
+
+        let mut env_vars = EnvVars::load_worktree(project_name, worktree_name)?;
+        env_vars.set(env_var.to_string(), db_url.clone());
+        env_vars.save_worktree(project_name, worktree_name)?;
+        println!("Set {env_var} for worktree '{project_name}/{worktree_name}'");
+
+        if let Some(cmd) = &db_config.setup_command {
+            println!("Running setup command: {cmd}");
+            run_setup_command(cmd, &worktree_path, env_var, &db_url)?;
+            println!("Setup command completed");
+        }
+    }
+
     Ok(())
 }
 
@@ -452,11 +523,42 @@ fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_and_remove_worktree(
+    project_name: &str,
+    project: &config::Project,
+    wt: &config::Worktree,
+) -> Result<()> {
+    // Extract worktree dir name before removal (directory may be gone after)
+    let worktree_dir_name = wt
+        .path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    if let Some(db_config) = &project.database {
+        let db_name = db_config.db_name(project_name, &worktree_dir_name);
+        println!("Dropping database '{db_name}'...");
+        drop_database(&db_name)?;
+        println!("Dropped database '{db_name}'");
+    }
+
+    remove_worktree(project, &wt.path)?;
+
+    if project.database.is_some() {
+        let override_path = config::worktree_env_path(project_name, &worktree_dir_name)?;
+        if override_path.exists() {
+            std::fs::remove_file(&override_path)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn cmd_worktree_rm(name: &str) -> Result<()> {
     let config = Config::load()?;
 
     // Collect all worktrees across all projects
-    let mut matches: Vec<(&str, config::Worktree)> = Vec::new();
+    let mut matches: Vec<(&str, &config::Project, config::Worktree)> = Vec::new();
 
     for (project_name, project) in &config.projects {
         let worktrees = project.list_worktrees()?;
@@ -471,12 +573,12 @@ fn cmd_worktree_rm(name: &str) -> Result<()> {
             let full_name = format!("{project_name}-{dir_name}");
             if full_name == name {
                 // Exact match - use this one
-                return remove_worktree(project, &wt.path);
+                return cleanup_and_remove_worktree(project_name, project, &wt);
             }
 
             // Check if dirname matches
             if dir_name == name {
-                matches.push((project_name, wt));
+                matches.push((project_name, project, wt));
             }
         }
     }
@@ -484,14 +586,13 @@ fn cmd_worktree_rm(name: &str) -> Result<()> {
     match matches.len() {
         0 => Err(Error::WorktreeNotFound(name.to_string())),
         1 => {
-            let (project_name, wt) = matches.remove(0);
-            let project = config.projects.get(project_name).unwrap();
-            remove_worktree(project, &wt.path)
+            let (project_name, project, wt) = matches.remove(0);
+            cleanup_and_remove_worktree(project_name, project, &wt)
         }
         _ => {
             let candidates: Vec<String> = matches
                 .iter()
-                .map(|(proj, wt)| {
+                .map(|(proj, _, wt)| {
                     let dir_name = wt
                         .path
                         .file_name()

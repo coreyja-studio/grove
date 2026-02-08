@@ -1624,6 +1624,263 @@ mod json_export {
 // init-mise tests
 // =============================================================================
 
+// =============================================================================
+// Database provisioning tests
+// =============================================================================
+
+mod database {
+    use super::*;
+
+    fn postgres_available() -> bool {
+        // Check that psql can actually connect, not just that the binary exists.
+        // On CI runners the binaries are installed but the server isn't running.
+        Command::new("psql")
+            .args(["-c", "SELECT 1"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Write a config file with a database section for a project.
+    fn write_config_with_database(
+        config_dir: &TempDir,
+        project_name: &str,
+        project_path: &std::path::Path,
+        url_template: &str,
+        setup_command: Option<&str>,
+    ) {
+        let setup_line = setup_command
+            .map(|cmd| format!("setup_command = \"{cmd}\""))
+            .unwrap_or_default();
+        let config_content = format!(
+            r#"[projects.{project_name}]
+path = "{}"
+
+[projects.{project_name}.database]
+url_template = "{url_template}"
+{setup_line}
+"#,
+            project_path.display()
+        );
+        let config_path = config_dir.path().join("config.toml");
+        fs::write(&config_path, config_content).unwrap();
+    }
+
+    #[test]
+    fn test_worktree_creation_with_database() {
+        if !postgres_available() {
+            return;
+        }
+
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+        let canonical = repo.canonicalize().unwrap();
+
+        let db_name = "myproject_testfeat";
+
+        // Cleanup from any previous failed runs
+        let _ = Command::new("dropdb")
+            .args(["--if-exists", db_name])
+            .output();
+
+        write_config_with_database(
+            &config_dir,
+            "myproject",
+            &canonical,
+            "postgres:///{{db_name}}",
+            None,
+        );
+
+        // Create worktree
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "testfeat"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Creating database"))
+            .stdout(predicate::str::contains("Created database"))
+            .stdout(predicate::str::contains("Set DATABASE_URL"));
+
+        // Verify database exists
+        let psql_output = Command::new("psql")
+            .args(["-d", db_name, "-c", "SELECT 1"])
+            .output()
+            .expect("failed to run psql");
+        assert!(
+            psql_output.status.success(),
+            "Database should exist and be queryable"
+        );
+
+        // Verify env override file exists
+        let override_path = config_dir.path().join("envs/myproject/testfeat.toml");
+        assert!(override_path.exists(), "Env override file should exist");
+
+        // Verify grove env export includes the database URL
+        let worktree_path = canonical.join(".worktrees/testfeat");
+        grove_cmd(&config_dir)
+            .args(["env", "export", worktree_path.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "export DATABASE_URL='postgres:///myproject_testfeat'",
+            ));
+
+        // Cleanup
+        let _ = Command::new("dropdb")
+            .args(["--if-exists", db_name])
+            .output();
+    }
+
+    #[test]
+    fn test_worktree_removal_with_database_cleanup() {
+        if !postgres_available() {
+            return;
+        }
+
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+        let canonical = repo.canonicalize().unwrap();
+
+        let db_name = "myproject_rmfeat";
+
+        // Cleanup from any previous failed runs
+        let _ = Command::new("dropdb")
+            .args(["--if-exists", db_name])
+            .output();
+
+        write_config_with_database(
+            &config_dir,
+            "myproject",
+            &canonical,
+            "postgres:///{{db_name}}",
+            None,
+        );
+
+        // Create worktree
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "rmfeat"])
+            .assert()
+            .success();
+
+        // Verify database was created
+        let psql_output = Command::new("psql")
+            .args(["-d", db_name, "-c", "SELECT 1"])
+            .output()
+            .expect("failed to run psql");
+        assert!(psql_output.status.success(), "Database should exist");
+
+        // Remove worktree
+        grove_cmd(&config_dir)
+            .args(["worktree", "rm", "myproject-rmfeat"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Dropping database"))
+            .stdout(predicate::str::contains("Dropped database"))
+            .stdout(predicate::str::contains("Removed worktree"));
+
+        // Verify database is gone
+        let psql_output = Command::new("psql")
+            .args(["-d", db_name, "-c", "SELECT 1"])
+            .output()
+            .expect("failed to run psql");
+        assert!(
+            !psql_output.status.success(),
+            "Database should not exist after removal"
+        );
+
+        // Verify env override file is gone
+        let override_path = config_dir.path().join("envs/myproject/rmfeat.toml");
+        assert!(
+            !override_path.exists(),
+            "Env override file should be removed"
+        );
+
+        // Cleanup (just in case)
+        let _ = Command::new("dropdb")
+            .args(["--if-exists", db_name])
+            .output();
+    }
+
+    #[test]
+    fn test_worktree_creation_without_database_config() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        // Add project normally (no database config)
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Create worktree
+        let output = grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "nodb"])
+            .assert()
+            .success();
+
+        // Should NOT mention database
+        output
+            .stdout(predicate::str::contains("Creating database").not())
+            .stdout(predicate::str::contains("DATABASE_URL").not());
+
+        // No env override file should be created
+        let override_path = config_dir.path().join("envs/myproject/nodb.toml");
+        assert!(
+            !override_path.exists(),
+            "No env override file should be created without database config"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_runs() {
+        if !postgres_available() {
+            return;
+        }
+
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+        let canonical = repo.canonicalize().unwrap();
+
+        let db_name = "myproject_setupfeat";
+
+        // Cleanup from any previous failed runs
+        let _ = Command::new("dropdb")
+            .args(["--if-exists", db_name])
+            .output();
+
+        write_config_with_database(
+            &config_dir,
+            "myproject",
+            &canonical,
+            "postgres:///{{db_name}}",
+            Some("touch .db-setup-done"),
+        );
+
+        // Create worktree
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "setupfeat"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Running setup command"))
+            .stdout(predicate::str::contains("Setup command completed"));
+
+        // Verify the setup command ran
+        let marker_path = canonical.join(".worktrees/setupfeat/.db-setup-done");
+        assert!(
+            marker_path.exists(),
+            "Setup command should have created .db-setup-done in worktree"
+        );
+
+        // Cleanup
+        let _ = Command::new("dropdb")
+            .args(["--if-exists", db_name])
+            .output();
+    }
+}
+
 mod init_mise {
     use super::*;
 

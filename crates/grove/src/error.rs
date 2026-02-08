@@ -60,4 +60,13 @@ pub enum Error {
 
     #[error("Could not determine data directory for mise plugin installation")]
     NoDataDir,
+
+    #[error("Failed to create database: {0}")]
+    DatabaseCreationFailed(String),
+
+    #[error("Failed to drop database: {0}")]
+    DatabaseDropFailed(String),
+
+    #[error("Setup command failed: {0}")]
+    SetupCommandFailed(String),
 }
