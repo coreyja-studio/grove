@@ -70,6 +70,12 @@ impl DatabaseConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HooksConfig {
+    #[serde(default)]
+    pub post_create: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Project {
     pub path: PathBuf,
@@ -77,6 +83,8 @@ pub struct Project {
     pub worktree_base: Option<PathBuf>,
     #[serde(default)]
     pub database: Option<DatabaseConfig>,
+    #[serde(default)]
+    pub hooks: Option<HooksConfig>,
 }
 
 #[derive(Debug)]
@@ -224,6 +232,7 @@ impl Config {
                 path: canonical,
                 worktree_base: None,
                 database: None,
+                hooks: None,
             },
         );
         Ok(())
@@ -540,6 +549,7 @@ path = "/tmp/myproject"
                         path: PathBuf::from("/tmp/myproject"),
                         worktree_base: None,
                         database: Some(db_config.clone()),
+                        hooks: None,
                     },
                 );
                 m
@@ -549,5 +559,78 @@ path = "/tmp/myproject"
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         let project = deserialized.projects.get("myproject").unwrap();
         assert_eq!(project.database.as_ref(), Some(&db_config));
+    }
+
+    #[test]
+    fn test_hooks_config_deserialization() {
+        let toml_str = r#"
+[projects.myproject]
+path = "/tmp/myproject"
+
+[projects.myproject.hooks]
+post_create = ["yarn install", "cargo fetch"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let project = config.projects.get("myproject").unwrap();
+        let hooks = project.hooks.as_ref().unwrap();
+        assert_eq!(hooks.post_create.len(), 2);
+        assert_eq!(hooks.post_create[0], "yarn install");
+        assert_eq!(hooks.post_create[1], "cargo fetch");
+    }
+
+    #[test]
+    fn test_hooks_config_absent_backward_compat() {
+        let toml_str = r#"
+[projects.myproject]
+path = "/tmp/myproject"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let project = config.projects.get("myproject").unwrap();
+        assert!(project.hooks.is_none());
+    }
+
+    #[test]
+    fn test_hooks_config_empty_list() {
+        let toml_str = r#"
+[projects.myproject]
+path = "/tmp/myproject"
+
+[projects.myproject.hooks]
+post_create = []
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let project = config.projects.get("myproject").unwrap();
+        assert_eq!(
+            project.hooks.as_ref(),
+            Some(&HooksConfig {
+                post_create: vec![]
+            })
+        );
+    }
+
+    #[test]
+    fn test_hooks_config_roundtrip() {
+        let hooks = HooksConfig {
+            post_create: vec!["yarn install".to_string(), "cargo fetch".to_string()],
+        };
+        let config = Config {
+            projects: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "myproject".to_string(),
+                    Project {
+                        path: PathBuf::from("/tmp/myproject"),
+                        worktree_base: None,
+                        database: None,
+                        hooks: Some(hooks.clone()),
+                    },
+                );
+                m
+            },
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        let project = deserialized.projects.get("myproject").unwrap();
+        assert_eq!(project.hooks.as_ref(), Some(&hooks));
     }
 }

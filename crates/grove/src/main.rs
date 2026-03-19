@@ -397,6 +397,45 @@ fn run_setup_command(
     Ok(())
 }
 
+fn run_mise_trust(worktree_path: &std::path::Path) -> Result<()> {
+    let output = match std::process::Command::new("mise")
+        .arg("trust")
+        .current_dir(worktree_path)
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+
+    if output.status.success() {
+        println!("Ran mise trust");
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("Warning: mise trust failed: {stderr}");
+    }
+    Ok(())
+}
+
+fn run_post_create_hooks(hooks: &[String], worktree_path: &std::path::Path) -> Result<()> {
+    for cmd in hooks {
+        println!("Running hook: {cmd}");
+        let output = std::process::Command::new("sh")
+            .args(["-c", cmd])
+            .current_dir(worktree_path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(Error::HookFailed(
+                cmd.clone(),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        println!("Hook completed: {cmd}");
+    }
+    Ok(())
+}
+
 fn cmd_worktree_new(project_name: &str, worktree_name: &str) -> Result<()> {
     validate_worktree_name(worktree_name)?;
 
@@ -474,6 +513,16 @@ fn cmd_worktree_new(project_name: &str, worktree_name: &str) -> Result<()> {
             println!("Running setup command: {cmd}");
             run_setup_command(cmd, &worktree_path, env_var, &db_url)?;
             println!("Setup command completed");
+        }
+    }
+
+    // Run mise trust (built-in, no config needed)
+    run_mise_trust(&worktree_path)?;
+
+    // Run user-configured post-create hooks
+    if let Some(hooks) = &project.hooks {
+        if !hooks.post_create.is_empty() {
+            run_post_create_hooks(&hooks.post_create, &worktree_path)?;
         }
     }
 

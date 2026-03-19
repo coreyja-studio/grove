@@ -1881,6 +1881,118 @@ url_template = "{url_template}"
     }
 }
 
+mod hooks {
+    use super::*;
+
+    fn write_config_with_hooks(
+        config_dir: &TempDir,
+        project_name: &str,
+        project_path: &std::path::Path,
+        hooks: &[&str],
+    ) {
+        let hooks_toml: Vec<String> = hooks.iter().map(|h| format!("\"{h}\"")).collect();
+        let hooks_array = hooks_toml.join(", ");
+        let config_content = format!(
+            r#"[projects.{project_name}]
+path = "{}"
+
+[projects.{project_name}.hooks]
+post_create = [{hooks_array}]
+"#,
+            project_path.display()
+        );
+        let config_path = config_dir.path().join("config.toml");
+        fs::write(&config_path, config_content).unwrap();
+    }
+
+    #[test]
+    fn test_worktree_new_runs_post_create_hooks() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+        let canonical = repo.canonicalize().unwrap();
+
+        write_config_with_hooks(&config_dir, "myproject", &canonical, &["touch .hook-ran"]);
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "hookfeat"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Running hook"))
+            .stdout(predicate::str::contains("Hook completed"));
+
+        let marker_path = canonical.join(".worktrees/hookfeat/.hook-ran");
+        assert!(
+            marker_path.exists(),
+            "Hook should have created .hook-ran in worktree"
+        );
+    }
+
+    #[test]
+    fn test_worktree_new_hook_failure_stops_execution() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+        let canonical = repo.canonicalize().unwrap();
+
+        write_config_with_hooks(
+            &config_dir,
+            "myproject",
+            &canonical,
+            &["false", "touch .should-not-exist"],
+        );
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "failhook"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("Post-create hook failed"));
+
+        let marker_path = canonical.join(".worktrees/failhook/.should-not-exist");
+        assert!(
+            !marker_path.exists(),
+            "Second hook should not have run after first hook failed"
+        );
+    }
+
+    #[test]
+    fn test_worktree_new_no_hooks_backward_compat() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "nohooks"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Running hook").not())
+            .stdout(predicate::str::contains("Hook completed").not());
+    }
+
+    #[test]
+    fn test_worktree_new_mise_trust_runs() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Should succeed regardless of whether mise is installed
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "misetrust"])
+            .assert()
+            .success();
+    }
+}
+
 mod init_mise {
     use super::*;
 
