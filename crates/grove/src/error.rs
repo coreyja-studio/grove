@@ -69,4 +69,7 @@ pub enum Error {
 
     #[error("Setup command failed: {0}")]
     SetupCommandFailed(String),
+
+    #[error("Post-create hook failed: `{0}`\n{1}")]
+    HookFailed(String, String),
 }
