@@ -22,6 +22,9 @@ pub enum Error {
     #[error("Path does not belong to any registered project: {0}")]
     NoProjectForPath(PathBuf),
 
+    #[error("No project detected (not registered and no .grove/config.toml found)")]
+    NoProjectDetected,
+
     #[error("Invalid KEY=value format: {0}")]
     InvalidEnvFormat(String),
 

@@ -2049,3 +2049,406 @@ mod init_mise {
         assert!(metadata.contains(r#"PLUGIN.name = "grove""#));
     }
 }
+
+mod repo_config {
+    use super::*;
+
+    /// Create a .grove/config.toml in a directory and commit it to git.
+    /// The commit is required because `git worktree add` creates worktrees
+    /// from the repo's tracked files — uncommitted .grove/config.toml won't
+    /// appear in worktrees.
+    fn write_grove_config(repo_path: &std::path::Path, content: &str) {
+        let grove_dir = repo_path.join(".grove");
+        fs::create_dir_all(&grove_dir).unwrap();
+        fs::write(grove_dir.join("config.toml"), content).unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "add grove config", "--no-gpg-sign"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_worktree_new_auto_detect() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "feature"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Created worktree"));
+
+        assert!(repo.join(".worktrees/feature").exists());
+    }
+
+    #[test]
+    fn test_worktree_new_backward_compat() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "feature"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Created worktree"));
+    }
+
+    #[test]
+    fn test_env_export_from_repo_config() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(
+            &repo,
+            r#"
+name = "myproject"
+
+[env]
+RUST_LOG = "debug"
+NODE_ENV = "development"
+"#,
+        );
+
+        grove_cmd(&config_dir)
+            .args(["env", "export", "--json", repo.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("RUST_LOG"))
+            .stdout(predicate::str::contains("debug"));
+    }
+
+    #[test]
+    fn test_env_layering_user_overrides_repo() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(
+            &repo,
+            r#"
+name = "myproject"
+
+[env]
+RUST_LOG = "debug"
+SHARED = "from_repo"
+"#,
+        );
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["env", "set", "myproject", "RUST_LOG=info"])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["env", "export", "--json", repo.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""RUST_LOG":"info""#))
+            .stdout(predicate::str::contains(r#""SHARED":"from_repo""#));
+    }
+
+    #[test]
+    fn test_auto_detect_name_from_directory() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "cool-project");
+
+        write_grove_config(&repo, "");
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "feature"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Created worktree"));
+    }
+
+    #[test]
+    fn test_auto_detect_from_subdirectory() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        let subdir = repo.join("src").join("lib");
+        fs::create_dir_all(&subdir).unwrap();
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "feature"])
+            .current_dir(&subdir)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Created worktree"));
+    }
+
+    #[test]
+    fn test_no_project_detected_error() {
+        let config_dir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "feature"])
+            .current_dir(tmp.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("No project detected"));
+    }
+
+    #[test]
+    fn test_registered_project_takes_precedence() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(
+            &repo,
+            r#"
+name = "myproject"
+
+[hooks]
+post_create = ["echo from-repo"]
+"#,
+        );
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "myproject", "feature"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Created worktree"))
+            .stdout(predicate::str::contains("Running hook: echo from-repo"));
+    }
+
+    #[test]
+    fn test_env_list_auto_detect() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(
+            &repo,
+            r#"
+name = "myproject"
+
+[env]
+RUST_LOG = "debug"
+"#,
+        );
+
+        grove_cmd(&config_dir)
+            .args(["env", "list"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("RUST_LOG"));
+    }
+
+    #[test]
+    fn test_env_set_auto_detect() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
+        grove_cmd(&config_dir)
+            .args(["env", "set", "MY_VAR=hello"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "Set MY_VAR for project 'myproject'",
+            ));
+
+        grove_cmd(&config_dir)
+            .args(["env", "list"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("MY_VAR"));
+    }
+
+    #[test]
+    fn test_env_unset_auto_detect() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
+        grove_cmd(&config_dir)
+            .args(["env", "set", "MY_VAR=hello"])
+            .current_dir(&repo)
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["env", "unset", "MY_VAR"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "Unset MY_VAR for project 'myproject'",
+            ));
+
+        grove_cmd(&config_dir)
+            .args(["env", "list"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No environment variables"));
+    }
+
+    #[test]
+    fn test_worktree_list_auto_detect() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "feature"])
+            .current_dir(&repo)
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "list"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("myproject-feature"));
+    }
+
+    #[test]
+    fn test_worktree_rm_auto_detect() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "feature"])
+            .current_dir(&repo)
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "rm", "myproject-feature"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Removed worktree"));
+
+        assert!(!repo.join(".worktrees/feature").exists());
+    }
+
+    #[test]
+    fn test_discover_from_inside_worktree() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(
+            &repo,
+            r#"
+name = "myproject"
+
+[env]
+FROM_REPO = "yes"
+"#,
+        );
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "feature"])
+            .current_dir(&repo)
+            .assert()
+            .success();
+
+        let worktree_path = repo.join(".worktrees").join("feature");
+        assert!(worktree_path.exists());
+
+        grove_cmd(&config_dir)
+            .args(["env", "export", "--json", worktree_path.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("FROM_REPO"))
+            .stdout(predicate::str::contains("yes"));
+    }
+
+    #[test]
+    fn test_discover_from_external_worktree() {
+        // Critical test: external worktrees (outside repo tree) must work via .git file resolution
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let external_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(
+            &repo,
+            r#"
+name = "myproject"
+
+[env]
+FROM_REPO = "yes"
+"#,
+        );
+
+        let external_wt = external_dir.path().join("myproject-feature");
+        let output = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                external_wt.to_str().unwrap(),
+                "-b",
+                "ext-feature",
+            ])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git worktree add should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(external_wt.join(".git").is_file());
+        assert!(external_wt.join(".grove/config.toml").exists());
+
+        grove_cmd(&config_dir)
+            .args(["env", "export", "--json", external_wt.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("FROM_REPO"))
+            .stdout(predicate::str::contains("yes"));
+    }
+}
