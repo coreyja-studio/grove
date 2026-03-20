@@ -174,14 +174,19 @@ fn cmd_env_set(project_or_pair: &str, pair: Option<&str>) -> Result<()> {
     };
 
     let config = Config::load()?;
-    let project_ref = if let Some(s) = project_str {
-        ProjectRef::parse(s)?
+    // Resolve project once — either from explicit name or auto-detection.
+    // For the two-arg form, project_ref may include a worktree specifier (project/worktree).
+    let (project_ref, resolved) = if let Some(s) = project_str {
+        let pr = ProjectRef::parse(s)?;
+        let resolved = config::resolve_project(&config, Some(&pr.project))?;
+        (pr, resolved)
     } else {
-        let (name, _, _) = config::resolve_project(&config, None)?;
-        ProjectRef {
-            project: name,
+        let (name, project, repo_env) = config::resolve_project(&config, None)?;
+        let pr = ProjectRef {
+            project: name.clone(),
             worktree: None,
-        }
+        };
+        (pr, (name, project, repo_env))
     };
 
     let (key, value) = pair_str
@@ -189,16 +194,13 @@ fn cmd_env_set(project_or_pair: &str, pair: Option<&str>) -> Result<()> {
         .ok_or_else(|| Error::InvalidEnvFormat(pair_str.to_string()))?;
 
     if let Some(wt_name) = &project_ref.worktree {
-        let (_, project, _) = config::resolve_project(&config, Some(&project_ref.project))?;
-        validate_worktree_exists(&project, &project_ref.project, wt_name)?;
+        validate_worktree_exists(&resolved.1, &project_ref.project, wt_name)?;
 
         let mut vars = EnvVars::load_worktree(&project_ref.project, wt_name)?;
         vars.set(key.to_string(), value.to_string());
         vars.save_worktree(&project_ref.project, wt_name)?;
         println!("Set {key} for worktree '{}/{wt_name}'", project_ref.project);
     } else {
-        config::resolve_project(&config, Some(&project_ref.project))?;
-
         let mut vars = EnvVars::load(&project_ref.project)?;
         vars.set(key.to_string(), value.to_string());
         vars.save(&project_ref.project)?;
@@ -598,7 +600,8 @@ fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
     let config = Config::load()?;
 
     let mut found_any = false;
-    let mut seen_projects = std::collections::HashSet::new();
+    // Track seen repo paths (not names) to deduplicate when registered name ≠ effective_name()
+    let mut seen_repo_paths = std::collections::HashSet::new();
 
     // 1. Iterate registered projects
     for (project_name, project) in &config.projects {
@@ -608,7 +611,9 @@ fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
             }
         }
 
-        seen_projects.insert(project_name.clone());
+        if let Ok(canonical) = project.path.canonicalize() {
+            seen_repo_paths.insert(canonical);
+        }
         let worktrees = project.list_worktrees()?;
         for wt in worktrees {
             found_any = true;
@@ -624,18 +629,20 @@ fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
 
     // 2. Also include auto-detected project from cwd (if not already listed)
     let cwd = std::env::current_dir()?;
-    if let Some((repo_config, repo_root)) = config::RepoConfig::discover(&cwd)? {
-        let name = repo_config.effective_name(&repo_root);
+    let auto_detected = config::RepoConfig::discover(&cwd)?;
+    if let Some((ref repo_config, ref repo_root)) = auto_detected {
+        let name = repo_config.effective_name(repo_root);
 
         let matches_filter = match project_filter {
             Some(filter) => filter == name,
             None => true,
         };
 
-        if matches_filter && !seen_projects.contains(&name) {
+        // Deduplicate by repo path — covers the case where registered name ≠ effective_name()
+        if matches_filter && !seen_repo_paths.contains(repo_root) {
             let user_proj = config.projects.get(&name);
-            let path = user_proj.map(|p| p.path.clone()).unwrap_or(repo_root);
-            let project = config::merge_project(Some(&repo_config), user_proj, path);
+            let path = user_proj.map_or_else(|| repo_root.clone(), |p| p.path.clone());
+            let project = config::merge_project(Some(repo_config), user_proj, path);
             let worktrees = project.list_worktrees()?;
             for wt in worktrees {
                 found_any = true;
@@ -653,10 +660,9 @@ fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
     // 3. If filter was provided and nothing found, check validity
     if !found_any {
         if let Some(filter) = project_filter {
-            if !config.projects.contains_key(filter) && !seen_projects.contains(filter) {
-                let cwd = std::env::current_dir()?;
-                let auto_name =
-                    config::RepoConfig::discover(&cwd)?.map(|(rc, root)| rc.effective_name(&root));
+            if !config.projects.contains_key(filter) {
+                // Reuse the cached auto-detection result instead of re-running discover()
+                let auto_name = auto_detected.map(|(rc, root)| rc.effective_name(&root));
                 if auto_name.as_deref() != Some(filter) {
                     return Err(Error::ProjectNotFound(filter.to_string()));
                 }
@@ -705,11 +711,14 @@ fn cmd_worktree_rm(name: &str) -> Result<()> {
     let config = Config::load()?;
 
     let mut matches: Vec<(String, config::Project, config::Worktree)> = Vec::new();
-    let mut seen_projects = std::collections::HashSet::new();
+    // Track seen repo paths (not names) to deduplicate when registered name ≠ effective_name()
+    let mut seen_repo_paths = std::collections::HashSet::new();
 
     // 1. Search registered projects
     for (project_name, project) in &config.projects {
-        seen_projects.insert(project_name.clone());
+        if let Ok(canonical) = project.path.canonicalize() {
+            seen_repo_paths.insert(canonical);
+        }
         let worktrees = project.list_worktrees()?;
         for wt in worktrees {
             let dir_name = wt
@@ -732,8 +741,9 @@ fn cmd_worktree_rm(name: &str) -> Result<()> {
     // 2. Also search auto-detected project from cwd
     let cwd = std::env::current_dir()?;
     if let Some((repo_config, repo_root)) = config::RepoConfig::discover(&cwd)? {
-        let proj_name = repo_config.effective_name(&repo_root);
-        if !seen_projects.contains(&proj_name) {
+        // Deduplicate by repo path — covers the case where registered name ≠ effective_name()
+        if !seen_repo_paths.contains(&repo_root) {
+            let proj_name = repo_config.effective_name(&repo_root);
             let user_proj = config.projects.get(&proj_name);
             let path = user_proj.map(|p| p.path.clone()).unwrap_or(repo_root);
             let project = config::merge_project(Some(&repo_config), user_proj, path);

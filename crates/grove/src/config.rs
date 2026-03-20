@@ -142,7 +142,9 @@ fn resolve_main_repo_from_dot_git_file(dot_git_file: &Path) -> Result<Option<Pat
         return Ok(None);
     };
 
-    let base_dir = dot_git_file.parent().unwrap();
+    let base_dir = dot_git_file
+        .parent()
+        .expect("dot_git_file always has a parent directory");
     let gitdir_path = if Path::new(gitdir_str).is_absolute() {
         PathBuf::from(gitdir_str)
     } else {
@@ -574,6 +576,8 @@ pub fn resolve_project_for_path(
         let proj_path = user_proj.map_or_else(|| repo_root.clone(), |p| p.path.clone());
         let merged = merge_project(Some(&repo_config), user_proj, proj_path);
 
+        // Note: discover() also canonicalizes internally, but doesn't expose the result.
+        // This second canonicalize is redundant but cheap — not worth changing the API for.
         let canonical = path.canonicalize()?;
         let worktree = {
             let worktrees = merged.list_worktrees()?;
@@ -988,18 +992,26 @@ NODE_ENV = "development"
     }
 
     #[test]
-    fn test_load_merged_env_three_layers() {
+    fn test_load_merged_env_repo_layer() {
         let repo_env: BTreeMap<String, String> =
             [("REPO_VAR".to_string(), "from_repo".to_string())]
                 .into_iter()
                 .collect();
 
-        let result = load_merged_env("nonexistent_test_project_12345", None, &repo_env);
-        if let Ok(merged) = result {
-            assert_eq!(merged.len(), 1);
-            assert_eq!(merged[0].key, "REPO_VAR");
-            assert_eq!(merged[0].value, "from_repo");
-        }
+        // EnvVars::load returns empty when no file exists (returns default).
+        // The repo env layer should come through as the base.
+        let merged = load_merged_env("nonexistent_test_project_12345", None, &repo_env).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].key, "REPO_VAR");
+        assert_eq!(merged[0].value, "from_repo");
+        assert!(matches!(merged[0].source, EnvSource::Repo));
+    }
+
+    #[test]
+    fn test_load_merged_env_empty_layers() {
+        let repo_env = BTreeMap::new();
+        let merged = load_merged_env("nonexistent_test_project_12345", None, &repo_env).unwrap();
+        assert!(merged.is_empty());
     }
 
     #[test]
