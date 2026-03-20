@@ -76,7 +76,111 @@ pub struct HooksConfig {
     pub post_create: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct RepoConfig {
+    pub name: Option<String>,
+    #[serde(default)]
+    pub database: Option<DatabaseConfig>,
+    #[serde(default)]
+    pub hooks: Option<HooksConfig>,
+    #[serde(default)]
+    pub env: Option<BTreeMap<String, String>>,
+}
+
+impl RepoConfig {
+    pub fn load_from_dir(dir: &Path) -> Result<Option<Self>> {
+        let config_path = dir.join(".grove").join("config.toml");
+        if !config_path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&config_path)?;
+        let config: RepoConfig = toml::from_str(&content)?;
+        Ok(Some(config))
+    }
+
+    /// Walk up from `path` looking for `.grove/config.toml`.
+    /// Returns `(config, repo_root)` where the second element is the main repo root.
+    /// When `.git` is a file (worktree), reads it and resolves back to main repo root.
+    pub fn discover(path: &Path) -> Result<Option<(Self, PathBuf)>> {
+        let mut current = path.canonicalize()?;
+        loop {
+            if let Some(config) = Self::load_from_dir(&current)? {
+                let dot_git = current.join(".git");
+                if dot_git.is_file() {
+                    if let Some(main_repo) = resolve_main_repo_from_dot_git_file(&dot_git)? {
+                        return Ok(Some((config, main_repo)));
+                    }
+                    // Resolution failed — fall through to continue walking up
+                } else {
+                    return Ok(Some((config, current)));
+                }
+            }
+            if !current.pop() {
+                return Ok(None);
+            }
+        }
+    }
+
+    pub fn effective_name(&self, repo_root: &Path) -> String {
+        self.name.clone().unwrap_or_else(|| {
+            repo_root.file_name().map_or_else(
+                || "unknown".to_string(),
+                |n| n.to_string_lossy().to_string(),
+            )
+        })
+    }
+}
+
+/// Resolve a git worktree's `.git` file to find the main repository root.
+///
+/// In a git worktree, `.git` is a file containing `gitdir: <path>`, where
+/// `<path>` points to `<main_repo>/.git/worktrees/<name>`. Walks up the gitdir
+/// path to find the `.git` component and returns its parent as the main repo root.
+fn resolve_main_repo_from_dot_git_file(dot_git_file: &Path) -> Result<Option<PathBuf>> {
+    let content = fs::read_to_string(dot_git_file)?;
+    let Some(gitdir_str) = content.trim().strip_prefix("gitdir: ") else {
+        return Ok(None);
+    };
+
+    let base_dir = dot_git_file
+        .parent()
+        .expect("dot_git_file always has a parent directory");
+    let gitdir_path = if Path::new(gitdir_str).is_absolute() {
+        PathBuf::from(gitdir_str)
+    } else {
+        base_dir.join(gitdir_str)
+    };
+
+    let Ok(canonical) = gitdir_path.canonicalize() else {
+        return Ok(None);
+    };
+
+    for ancestor in canonical.ancestors() {
+        if ancestor.file_name() == Some(std::ffi::OsStr::new(".git")) {
+            return Ok(ancestor.parent().map(Path::to_path_buf));
+        }
+    }
+
+    Ok(None)
+}
+
+pub fn merge_project(
+    repo_config: Option<&RepoConfig>,
+    user_project: Option<&Project>,
+    path: PathBuf,
+) -> Project {
+    let repo_db = repo_config.and_then(|rc| rc.database.clone());
+    let repo_hooks = repo_config.and_then(|rc| rc.hooks.clone());
+
+    Project {
+        path,
+        worktree_base: user_project.and_then(|p| p.worktree_base.clone()),
+        database: user_project.and_then(|p| p.database.clone()).or(repo_db),
+        hooks: user_project.and_then(|p| p.hooks.clone()).or(repo_hooks),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub path: PathBuf,
     #[serde(default)]
@@ -337,6 +441,7 @@ impl EnvVars {
 
 #[derive(Debug, Clone, Copy)]
 pub enum EnvSource {
+    Repo,
     Project,
     Worktree,
 }
@@ -348,18 +453,27 @@ pub struct MergedEnvVar {
     pub source: EnvSource,
 }
 
-pub fn load_merged_env(project_ref: &ProjectRef) -> Result<Vec<MergedEnvVar>> {
-    let base = EnvVars::load(&project_ref.project)?;
-
-    let mut merged: BTreeMap<String, (String, EnvSource)> = base
-        .vars
-        .into_iter()
-        .map(|(k, v)| (k, (v, EnvSource::Project)))
+pub fn load_merged_env(
+    project_name: &str,
+    worktree: Option<&str>,
+    repo_env: &BTreeMap<String, String>,
+) -> Result<Vec<MergedEnvVar>> {
+    // Layer 1: repo env vars (base)
+    let mut merged: BTreeMap<String, (String, EnvSource)> = repo_env
+        .iter()
+        .map(|(k, v)| (k.clone(), (v.clone(), EnvSource::Repo)))
         .collect();
 
-    if let Some(wt) = &project_ref.worktree {
-        let overrides = EnvVars::load_worktree(&project_ref.project, wt)?;
-        for (k, v) in overrides.vars {
+    // Layer 2: user project-level env vars
+    let user_env = EnvVars::load(project_name)?;
+    for (k, v) in user_env.vars {
+        merged.insert(k, (v, EnvSource::Project));
+    }
+
+    // Layer 3: user worktree-level env vars
+    if let Some(wt) = worktree {
+        let wt_env = EnvVars::load_worktree(project_name, wt)?;
+        for (k, v) in wt_env.vars {
             merged.insert(k, (v, EnvSource::Worktree));
         }
     }
@@ -368,6 +482,119 @@ pub fn load_merged_env(project_ref: &ProjectRef) -> Result<Vec<MergedEnvVar>> {
         .into_iter()
         .map(|(key, (value, source))| MergedEnvVar { key, value, source })
         .collect())
+}
+
+/// Resolve a project by explicit name or auto-detection from cwd.
+/// Returns `(name, project, repo_env_vars)`.
+pub fn resolve_project(
+    config: &Config,
+    explicit_name: Option<&str>,
+) -> Result<(String, Project, BTreeMap<String, String>)> {
+    if let Some(name) = explicit_name {
+        if let Some(user_proj) = config.projects.get(name) {
+            let repo_config = RepoConfig::load_from_dir(&user_proj.path)?;
+            let merged = merge_project(
+                repo_config.as_ref(),
+                Some(user_proj),
+                user_proj.path.clone(),
+            );
+            let repo_env = repo_config.and_then(|rc| rc.env).unwrap_or_default();
+            return Ok((name.to_string(), merged, repo_env));
+        }
+
+        // Not registered — try auto-detection from cwd and match by name
+        let cwd = std::env::current_dir()?;
+        if let Some((repo_config, repo_root)) = RepoConfig::discover(&cwd)? {
+            let detected_name = repo_config.effective_name(&repo_root);
+            if detected_name == name {
+                let user_proj = config.projects.get(&detected_name);
+                let path = user_proj.map_or(repo_root, |p| p.path.clone());
+                let merged = merge_project(Some(&repo_config), user_proj, path);
+                let repo_env = repo_config.env.unwrap_or_default();
+                return Ok((name.to_string(), merged, repo_env));
+            }
+        }
+
+        return Err(Error::ProjectNotFound(name.to_string()));
+    }
+
+    let cwd = std::env::current_dir()?;
+
+    if let Some(project_ref) = config.find_project_for_path(&cwd)? {
+        let user_proj = config.projects.get(&project_ref.project).unwrap();
+        let repo_config = RepoConfig::load_from_dir(&user_proj.path)?;
+        let merged = merge_project(
+            repo_config.as_ref(),
+            Some(user_proj),
+            user_proj.path.clone(),
+        );
+        let repo_env = repo_config.and_then(|rc| rc.env).unwrap_or_default();
+        return Ok((project_ref.project, merged, repo_env));
+    }
+
+    if let Some((repo_config, repo_root)) = RepoConfig::discover(&cwd)? {
+        let name = repo_config.effective_name(&repo_root);
+        let user_proj = config.projects.get(&name);
+        let path = user_proj.map(|p| p.path.clone()).unwrap_or(repo_root);
+        let merged = merge_project(Some(&repo_config), user_proj, path);
+        let repo_env = repo_config.env.unwrap_or_default();
+        return Ok((name, merged, repo_env));
+    }
+
+    Err(Error::NoProjectDetected)
+}
+
+/// Resolved project info for a filesystem path.
+pub type ResolvedProjectForPath = (String, Project, Option<String>, BTreeMap<String, String>);
+
+/// Resolve a project for a filesystem path (used by env export).
+/// Returns `(name, project, worktree_name, repo_env_vars)`.
+pub fn resolve_project_for_path(
+    config: &Config,
+    path: &Path,
+) -> Result<Option<ResolvedProjectForPath>> {
+    if let Some(project_ref) = config.find_project_for_path(path)? {
+        let user_proj = config.projects.get(&project_ref.project).unwrap();
+        let repo_config = RepoConfig::load_from_dir(&user_proj.path)?;
+        let merged = merge_project(
+            repo_config.as_ref(),
+            Some(user_proj),
+            user_proj.path.clone(),
+        );
+        let repo_env = repo_config.and_then(|rc| rc.env).unwrap_or_default();
+        return Ok(Some((
+            project_ref.project,
+            merged,
+            project_ref.worktree,
+            repo_env,
+        )));
+    }
+
+    if let Some((repo_config, repo_root)) = RepoConfig::discover(path)? {
+        let name = repo_config.effective_name(&repo_root);
+        let user_proj = config.projects.get(&name);
+        let proj_path = user_proj.map_or_else(|| repo_root.clone(), |p| p.path.clone());
+        let merged = merge_project(Some(&repo_config), user_proj, proj_path);
+
+        // Note: discover() also canonicalizes internally, but doesn't expose the result.
+        // This second canonicalize is redundant but cheap — not worth changing the API for.
+        let canonical = path.canonicalize()?;
+        let worktree = {
+            let worktrees = merged.list_worktrees()?;
+            worktrees.into_iter().find_map(|wt| {
+                if canonical.starts_with(&wt.path) {
+                    wt.path.file_name().map(|n| n.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+        };
+
+        let repo_env = repo_config.env.unwrap_or_default();
+        return Ok(Some((name, merged, worktree, repo_env)));
+    }
+
+    Ok(None)
 }
 
 pub fn export_merged_env(vars: &[MergedEnvVar]) -> String {
@@ -632,5 +859,204 @@ post_create = []
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         let project = deserialized.projects.get("myproject").unwrap();
         assert_eq!(project.hooks.as_ref(), Some(&hooks));
+    }
+
+    #[test]
+    fn test_repo_config_deserialization() {
+        let toml_str = r#"
+name = "mull"
+
+[database]
+url_template = "postgres:///{{db_name}}"
+setup_command = "cargo sqlx database setup"
+
+[hooks]
+post_create = ["yarn install"]
+
+[env]
+RUST_LOG = "debug"
+NODE_ENV = "development"
+"#;
+        let config: RepoConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.name.as_deref(), Some("mull"));
+        assert!(config.database.is_some());
+        assert_eq!(config.hooks.as_ref().unwrap().post_create.len(), 1);
+        let env = config.env.as_ref().unwrap();
+        assert_eq!(env.get("RUST_LOG").unwrap(), "debug");
+    }
+
+    #[test]
+    fn test_repo_config_minimal() {
+        let toml_str = "";
+        let config: RepoConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.name.is_none());
+        assert!(config.database.is_none());
+        assert!(config.hooks.is_none());
+        assert!(config.env.is_none());
+    }
+
+    #[test]
+    fn test_repo_config_name_only() {
+        let toml_str = r#"name = "myproject""#;
+        let config: RepoConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.name.as_deref(), Some("myproject"));
+    }
+
+    #[test]
+    fn test_effective_name_explicit() {
+        let config = RepoConfig {
+            name: Some("mull".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.effective_name(Path::new("/home/user/code/my-repo")),
+            "mull"
+        );
+    }
+
+    #[test]
+    fn test_effective_name_fallback_to_dir() {
+        let config = RepoConfig::default();
+        assert_eq!(
+            config.effective_name(Path::new("/home/user/code/my-repo")),
+            "my-repo"
+        );
+    }
+
+    #[test]
+    fn test_merge_project_repo_only() {
+        let repo = RepoConfig {
+            database: Some(DatabaseConfig {
+                url_template: "postgres:///{{db_name}}".to_string(),
+                setup_command: None,
+                env_var: None,
+            }),
+            hooks: Some(HooksConfig {
+                post_create: vec!["yarn install".to_string()],
+            }),
+            ..Default::default()
+        };
+        let merged = merge_project(Some(&repo), None, PathBuf::from("/tmp/repo"));
+        assert_eq!(merged.path, PathBuf::from("/tmp/repo"));
+        assert!(merged.database.is_some());
+        assert!(merged.hooks.is_some());
+        assert!(merged.worktree_base.is_none());
+    }
+
+    #[test]
+    fn test_merge_project_user_overrides_repo() {
+        let repo = RepoConfig {
+            database: Some(DatabaseConfig {
+                url_template: "postgres:///{{db_name}}".to_string(),
+                setup_command: None,
+                env_var: None,
+            }),
+            ..Default::default()
+        };
+        let user = Project {
+            path: PathBuf::from("/tmp/repo"),
+            worktree_base: Some(PathBuf::from("/tmp/worktrees")),
+            database: Some(DatabaseConfig {
+                url_template: "postgres://localhost/{{db_name}}".to_string(),
+                setup_command: Some("migrate".to_string()),
+                env_var: None,
+            }),
+            hooks: None,
+        };
+        let merged = merge_project(Some(&repo), Some(&user), user.path.clone());
+        assert_eq!(
+            merged.database.as_ref().unwrap().url_template,
+            "postgres://localhost/{{db_name}}"
+        );
+        assert_eq!(merged.worktree_base, Some(PathBuf::from("/tmp/worktrees")));
+        assert!(merged.hooks.is_none());
+    }
+
+    #[test]
+    fn test_merge_project_repo_fills_gaps() {
+        let repo = RepoConfig {
+            hooks: Some(HooksConfig {
+                post_create: vec!["setup.sh".to_string()],
+            }),
+            ..Default::default()
+        };
+        let user = Project {
+            path: PathBuf::from("/tmp/repo"),
+            worktree_base: None,
+            database: None,
+            hooks: None,
+        };
+        let merged = merge_project(Some(&repo), Some(&user), user.path.clone());
+        assert!(merged.hooks.is_some());
+        assert_eq!(merged.hooks.unwrap().post_create, vec!["setup.sh"]);
+    }
+
+    #[test]
+    fn test_load_merged_env_repo_layer() {
+        let repo_env: BTreeMap<String, String> =
+            [("REPO_VAR".to_string(), "from_repo".to_string())]
+                .into_iter()
+                .collect();
+
+        // EnvVars::load returns empty when no file exists (returns default).
+        // The repo env layer should come through as the base.
+        let merged = load_merged_env("nonexistent_test_project_12345", None, &repo_env).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].key, "REPO_VAR");
+        assert_eq!(merged[0].value, "from_repo");
+        assert!(matches!(merged[0].source, EnvSource::Repo));
+    }
+
+    #[test]
+    fn test_load_merged_env_empty_layers() {
+        let repo_env = BTreeMap::new();
+        let merged = load_merged_env("nonexistent_test_project_12345", None, &repo_env).unwrap();
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_main_repo_from_dot_git_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let main_repo = tmp.path().join("main-repo");
+        let worktree = tmp.path().join("worktrees").join("feature");
+        let git_worktrees = main_repo.join(".git").join("worktrees").join("feature");
+
+        fs::create_dir_all(&git_worktrees).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+
+        let gitdir_content = format!("gitdir: {}", git_worktrees.display());
+        fs::write(worktree.join(".git"), &gitdir_content).unwrap();
+
+        let result = resolve_main_repo_from_dot_git_file(&worktree.join(".git")).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), main_repo.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_resolve_main_repo_from_dot_git_file_relative() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let main_repo = tmp.path().join("repos").join("main");
+        let worktree = main_repo.join(".worktrees").join("feature");
+        let git_worktrees = main_repo.join(".git").join("worktrees").join("feature");
+
+        fs::create_dir_all(&git_worktrees).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+
+        let gitdir_content = "gitdir: ../../.git/worktrees/feature";
+        fs::write(worktree.join(".git"), gitdir_content).unwrap();
+
+        let result = resolve_main_repo_from_dot_git_file(&worktree.join(".git")).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), main_repo.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_resolve_main_repo_invalid_format() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dot_git = tmp.path().join(".git");
+        fs::write(&dot_git, "not a valid gitdir line").unwrap();
+
+        let result = resolve_main_repo_from_dot_git_file(&dot_git).unwrap();
+        assert!(result.is_none());
     }
 }

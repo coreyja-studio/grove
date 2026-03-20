@@ -53,22 +53,22 @@ enum Commands {
 enum EnvCommands {
     /// Set an environment variable
     Set {
-        /// Project name or project/worktree
-        project: String,
-        /// KEY=value pair
-        pair: String,
+        /// Project name or KEY=value pair (auto-detects project from cwd if this is a KEY=value)
+        project_or_pair: String,
+        /// KEY=value pair (when provided, first argument is treated as project name)
+        pair: Option<String>,
     },
     /// Show all environment variables
     List {
-        /// Project name or project/worktree
-        project: String,
+        /// Project name or project/worktree (auto-detects from cwd if omitted)
+        project: Option<String>,
     },
     /// Remove an environment variable
     Unset {
-        /// Project name or project/worktree
-        project: String,
-        /// Environment variable key to remove
-        key: String,
+        /// Project name or env var key (auto-detects project from cwd if only one arg)
+        project_or_key: String,
+        /// Env var key (when provided, first argument is treated as project name)
+        key: Option<String>,
     },
     /// Output environment variables for the project containing a path
     Export {
@@ -84,10 +84,10 @@ enum EnvCommands {
 enum WorktreeCommands {
     /// Create a new worktree
     New {
-        /// Project name (must be registered)
-        project: String,
-        /// Worktree name (becomes branch name and directory suffix)
-        name: String,
+        /// Worktree name, or project name if second argument is provided
+        name_or_project: String,
+        /// Worktree name (when provided, first argument is treated as project name)
+        name: Option<String>,
     },
     /// List worktrees
     List {
@@ -116,14 +116,23 @@ fn run(command: Commands) -> Result<()> {
         Commands::List => cmd_list(),
         Commands::Remove { name } => cmd_remove(&name),
         Commands::Env { command } => match command {
-            EnvCommands::Set { project, pair } => cmd_env_set(&project, &pair),
-            EnvCommands::List { project } => cmd_env_list(&project),
-            EnvCommands::Unset { project, key } => cmd_env_unset(&project, &key),
+            EnvCommands::Set {
+                project_or_pair,
+                pair,
+            } => cmd_env_set(&project_or_pair, pair.as_deref()),
+            EnvCommands::List { project } => cmd_env_list(project.as_deref()),
+            EnvCommands::Unset {
+                project_or_key,
+                key,
+            } => cmd_env_unset(&project_or_key, key.as_deref()),
             EnvCommands::Export { json, path } => cmd_env_export(path, json),
         },
         Commands::InitMise => cmd_init_mise(),
         Commands::Worktree { command } => match command {
-            WorktreeCommands::New { project, name } => cmd_worktree_new(&project, &name),
+            WorktreeCommands::New {
+                name_or_project,
+                name,
+            } => cmd_worktree_new(&name_or_project, name.as_deref()),
             WorktreeCommands::List { project } => cmd_worktree_list(project.as_deref()),
             WorktreeCommands::Rm { name } => cmd_worktree_rm(&name),
         },
@@ -158,26 +167,39 @@ fn cmd_remove(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_env_set(project: &str, pair: &str) -> Result<()> {
-    let project_ref = ProjectRef::parse(project)?;
+fn cmd_env_set(project_or_pair: &str, pair: Option<&str>) -> Result<()> {
+    let (project_str, pair_str) = match pair {
+        Some(p) => (Some(project_or_pair), p),
+        None => (None, project_or_pair),
+    };
 
     let config = Config::load()?;
-    let proj = config
-        .projects
-        .get(&project_ref.project)
-        .ok_or_else(|| Error::ProjectNotFound(project_ref.project.clone()))?;
+    // Resolve project once — either from explicit name or auto-detection.
+    // For the two-arg form, project_ref may include a worktree specifier (project/worktree).
+    let (project_ref, resolved) = if let Some(s) = project_str {
+        let pr = ProjectRef::parse(s)?;
+        let resolved = config::resolve_project(&config, Some(&pr.project))?;
+        (pr, resolved)
+    } else {
+        let (name, project, repo_env) = config::resolve_project(&config, None)?;
+        let pr = ProjectRef {
+            project: name.clone(),
+            worktree: None,
+        };
+        (pr, (name, project, repo_env))
+    };
 
-    let (key, value) = pair
+    let (key, value) = pair_str
         .split_once('=')
-        .ok_or_else(|| Error::InvalidEnvFormat(pair.to_string()))?;
+        .ok_or_else(|| Error::InvalidEnvFormat(pair_str.to_string()))?;
 
     if let Some(wt_name) = &project_ref.worktree {
-        validate_worktree_exists(proj, &project_ref.project, wt_name)?;
+        validate_worktree_exists(&resolved.1, &project_ref.project, wt_name)?;
 
         let mut vars = EnvVars::load_worktree(&project_ref.project, wt_name)?;
         vars.set(key.to_string(), value.to_string());
         vars.save_worktree(&project_ref.project, wt_name)?;
-        println!("Set {key} for worktree '{project}'");
+        println!("Set {key} for worktree '{}/{wt_name}'", project_ref.project);
     } else {
         let mut vars = EnvVars::load(&project_ref.project)?;
         vars.set(key.to_string(), value.to_string());
@@ -188,20 +210,30 @@ fn cmd_env_set(project: &str, pair: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_env_unset(project: &str, key: &str) -> Result<()> {
-    let project_ref = ProjectRef::parse(project)?;
+fn cmd_env_unset(project_or_key: &str, key: Option<&str>) -> Result<()> {
+    let (project_str, actual_key) = match key {
+        Some(k) => (Some(project_or_key), k),
+        None => (None, project_or_key),
+    };
 
     let config = Config::load()?;
-    let proj = config
-        .projects
-        .get(&project_ref.project)
-        .ok_or_else(|| Error::ProjectNotFound(project_ref.project.clone()))?;
+    let project_ref = if let Some(s) = project_str {
+        ProjectRef::parse(s)?
+    } else {
+        let (name, _, _) = config::resolve_project(&config, None)?;
+        ProjectRef {
+            project: name,
+            worktree: None,
+        }
+    };
+
+    let (_, resolved_project, _) = config::resolve_project(&config, Some(&project_ref.project))?;
 
     if let Some(wt_name) = &project_ref.worktree {
-        validate_worktree_exists(proj, &project_ref.project, wt_name)?;
+        validate_worktree_exists(&resolved_project, &project_ref.project, wt_name)?;
 
         let mut vars = EnvVars::load_worktree(&project_ref.project, wt_name)?;
-        if vars.remove(key) {
+        if vars.remove(actual_key) {
             if vars.vars.is_empty() {
                 let path = config::worktree_env_path(&project_ref.project, wt_name)?;
                 if path.exists() {
@@ -210,13 +242,19 @@ fn cmd_env_unset(project: &str, key: &str) -> Result<()> {
             } else {
                 vars.save_worktree(&project_ref.project, wt_name)?;
             }
-            println!("Unset {key} for worktree '{project}'");
+            println!(
+                "Unset {actual_key} for worktree '{}/{wt_name}'",
+                project_ref.project
+            );
         } else {
-            println!("Key '{key}' not found in worktree '{project}'");
+            println!(
+                "Key '{actual_key}' not found in worktree '{}/{wt_name}'",
+                project_ref.project
+            );
         }
     } else {
         let mut vars = EnvVars::load(&project_ref.project)?;
-        if vars.remove(key) {
+        if vars.remove(actual_key) {
             if vars.vars.is_empty() {
                 let path = config::env_path(&project_ref.project)?;
                 if path.exists() {
@@ -225,40 +263,52 @@ fn cmd_env_unset(project: &str, key: &str) -> Result<()> {
             } else {
                 vars.save(&project_ref.project)?;
             }
-            println!("Unset {key} for project '{}'", project_ref.project);
+            println!("Unset {actual_key} for project '{}'", project_ref.project);
         } else {
-            println!("Key '{key}' not found in project '{}'", project_ref.project);
+            println!(
+                "Key '{actual_key}' not found in project '{}'",
+                project_ref.project
+            );
         }
     }
 
     Ok(())
 }
 
-fn cmd_env_list(project: &str) -> Result<()> {
-    let project_ref = ProjectRef::parse(project)?;
-
+fn cmd_env_list(project: Option<&str>) -> Result<()> {
     let config = Config::load()?;
-    let proj = config
-        .projects
-        .get(&project_ref.project)
-        .ok_or_else(|| Error::ProjectNotFound(project_ref.project.clone()))?;
+
+    let project_ref = if let Some(s) = project {
+        ProjectRef::parse(s)?
+    } else {
+        let (name, _, _) = config::resolve_project(&config, None)?;
+        ProjectRef {
+            project: name,
+            worktree: None,
+        }
+    };
+
+    let (_, resolved_project, repo_env) =
+        config::resolve_project(&config, Some(&project_ref.project))?;
 
     if let Some(wt_name) = &project_ref.worktree {
-        validate_worktree_exists(proj, &project_ref.project, wt_name)?;
+        validate_worktree_exists(&resolved_project, &project_ref.project, wt_name)?;
 
-        let merged = config::load_merged_env(&project_ref)?;
+        let merged = config::load_merged_env(&project_ref.project, Some(wt_name), &repo_env)?;
         if merged.is_empty() {
-            println!("No environment variables set for '{project}'");
+            println!(
+                "No environment variables set for '{}/{wt_name}'",
+                project_ref.project
+            );
             return Ok(());
         }
 
-        // Calculate max key length for alignment
         let max_key_len = merged.iter().map(|v| v.key.len()).max().unwrap_or(0);
-
         for var in &merged {
             let source_label = match var.source {
-                config::EnvSource::Worktree => "(override)",
+                config::EnvSource::Repo => "(from repo)",
                 config::EnvSource::Project => "(from project)",
+                config::EnvSource::Worktree => "(override)",
             };
             println!(
                 "{:width$} = {}  {}",
@@ -269,14 +319,32 @@ fn cmd_env_list(project: &str) -> Result<()> {
             );
         }
     } else {
-        // Project-only: use existing code path unchanged for backward compatibility
-        let vars = EnvVars::load(&project_ref.project)?;
-        if vars.vars.is_empty() {
+        let merged = config::load_merged_env(&project_ref.project, None, &repo_env)?;
+        if merged.is_empty() {
             println!("No environment variables set for '{}'", project_ref.project);
             return Ok(());
         }
-        for (key, value) in &vars.vars {
-            println!("{key}={value}");
+
+        if repo_env.is_empty() {
+            // Backward compat: no repo env, use plain KEY=value format
+            for var in &merged {
+                println!("{}={}", var.key, var.value);
+            }
+        } else {
+            let max_key_len = merged.iter().map(|v| v.key.len()).max().unwrap_or(0);
+            for var in &merged {
+                let source_label = match var.source {
+                    config::EnvSource::Repo => "(from repo)",
+                    config::EnvSource::Project | config::EnvSource::Worktree => "(override)",
+                };
+                println!(
+                    "{:width$} = {}  {}",
+                    var.key,
+                    var.value,
+                    source_label,
+                    width = max_key_len
+                );
+            }
         }
     }
 
@@ -291,22 +359,24 @@ fn cmd_env_export(path: PathBuf, json: bool) -> Result<()> {
         }
 
         let config = Config::load()?;
-        let Some(project_ref) = config.find_project_for_path(&path)? else {
+        let Some((name, _project, worktree, repo_env)) =
+            config::resolve_project_for_path(&config, &path)?
+        else {
             println!("{{}}");
             return Ok(());
         };
 
-        let merged = config::load_merged_env(&project_ref)?;
+        let merged = config::load_merged_env(&name, worktree.as_deref(), &repo_env)?;
         let map: BTreeMap<String, String> = merged.into_iter().map(|v| (v.key, v.value)).collect();
         let json_str = serde_json::to_string(&map)?;
         println!("{json_str}");
     } else {
         let config = Config::load()?;
-        let project_ref = config
-            .find_project_for_path(&path)?
-            .ok_or(Error::NoProjectForPath(path))?;
+        let (name, _project, worktree, repo_env) =
+            config::resolve_project_for_path(&config, &path)?
+                .ok_or(Error::NoProjectForPath(path))?;
 
-        let merged = config::load_merged_env(&project_ref)?;
+        let merged = config::load_merged_env(&name, worktree.as_deref(), &repo_env)?;
         let output = config::export_merged_env(&merged);
         if !output.is_empty() {
             println!("{output}");
@@ -436,14 +506,16 @@ fn run_post_create_hooks(hooks: &[String], worktree_path: &std::path::Path) -> R
     Ok(())
 }
 
-fn cmd_worktree_new(project_name: &str, worktree_name: &str) -> Result<()> {
+fn cmd_worktree_new(name_or_project: &str, name: Option<&str>) -> Result<()> {
+    let (explicit_project, worktree_name) = match name {
+        Some(wt_name) => (Some(name_or_project), wt_name),
+        None => (None, name_or_project),
+    };
+
     validate_worktree_name(worktree_name)?;
 
     let config = Config::load()?;
-    let project = config
-        .projects
-        .get(project_name)
-        .ok_or_else(|| Error::ProjectNotFound(project_name.to_string()))?;
+    let (project_name, project, _repo_env) = config::resolve_project(&config, explicit_project)?;
 
     let worktree_base = project.worktree_base();
     let worktree_path = worktree_base.join(worktree_name);
@@ -452,12 +524,10 @@ fn cmd_worktree_new(project_name: &str, worktree_name: &str) -> Result<()> {
         return Err(Error::WorktreePathExists(worktree_path));
     }
 
-    // Create the worktree base directory if needed
     if !worktree_base.exists() {
         std::fs::create_dir_all(&worktree_base)?;
     }
 
-    // Try to create worktree with new branch first
     let output = std::process::Command::new("git")
         .args([
             "worktree",
@@ -470,7 +540,6 @@ fn cmd_worktree_new(project_name: &str, worktree_name: &str) -> Result<()> {
         .output()?;
 
     if !output.status.success() {
-        // If branch already exists, try without -b
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("already exists") {
             let output2 = std::process::Command::new("git")
@@ -496,17 +565,17 @@ fn cmd_worktree_new(project_name: &str, worktree_name: &str) -> Result<()> {
     println!("Created worktree at {}", worktree_path.display());
 
     if let Some(db_config) = &project.database {
-        let db_name = db_config.db_name(project_name, worktree_name);
+        let db_name = db_config.db_name(&project_name, worktree_name);
         println!("Creating database '{db_name}'...");
         create_database(&db_name)?;
         println!("Created database '{db_name}'");
 
-        let db_url = db_config.database_url(project_name, worktree_name);
+        let db_url = db_config.database_url(&project_name, worktree_name);
         let env_var = db_config.env_var_name();
 
-        let mut env_vars = EnvVars::load_worktree(project_name, worktree_name)?;
+        let mut env_vars = EnvVars::load_worktree(&project_name, worktree_name)?;
         env_vars.set(env_var.to_string(), db_url.clone());
-        env_vars.save_worktree(project_name, worktree_name)?;
+        env_vars.save_worktree(&project_name, worktree_name)?;
         println!("Set {env_var} for worktree '{project_name}/{worktree_name}'");
 
         if let Some(cmd) = &db_config.setup_command {
@@ -516,10 +585,8 @@ fn cmd_worktree_new(project_name: &str, worktree_name: &str) -> Result<()> {
         }
     }
 
-    // Run mise trust (built-in, no config needed)
     run_mise_trust(&worktree_path)?;
 
-    // Run user-configured post-create hooks
     if let Some(hooks) = &project.hooks {
         if !hooks.post_create.is_empty() {
             run_post_create_hooks(&hooks.post_create, &worktree_path)?;
@@ -532,15 +599,11 @@ fn cmd_worktree_new(project_name: &str, worktree_name: &str) -> Result<()> {
 fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
     let config = Config::load()?;
 
-    // If project specified, verify it exists
-    if let Some(name) = project_filter {
-        if !config.projects.contains_key(name) {
-            return Err(Error::ProjectNotFound(name.to_string()));
-        }
-    }
-
     let mut found_any = false;
+    // Track seen repo paths (not names) to deduplicate when registered name ≠ effective_name()
+    let mut seen_repo_paths = std::collections::HashSet::new();
 
+    // 1. Iterate registered projects
     for (project_name, project) in &config.projects {
         if let Some(filter) = project_filter {
             if project_name != filter {
@@ -548,6 +611,9 @@ fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
             }
         }
 
+        if let Ok(canonical) = project.path.canonicalize() {
+            seen_repo_paths.insert(canonical);
+        }
         let worktrees = project.list_worktrees()?;
         for wt in worktrees {
             found_any = true;
@@ -561,9 +627,47 @@ fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
         }
     }
 
+    // 2. Also include auto-detected project from cwd (if not already listed)
+    let cwd = std::env::current_dir()?;
+    let auto_detected = config::RepoConfig::discover(&cwd)?;
+    if let Some((ref repo_config, ref repo_root)) = auto_detected {
+        let name = repo_config.effective_name(repo_root);
+
+        let matches_filter = match project_filter {
+            Some(filter) => filter == name,
+            None => true,
+        };
+
+        // Deduplicate by repo path — covers the case where registered name ≠ effective_name()
+        if matches_filter && !seen_repo_paths.contains(repo_root) {
+            let user_proj = config.projects.get(&name);
+            let path = user_proj.map_or_else(|| repo_root.clone(), |p| p.path.clone());
+            let project = config::merge_project(Some(repo_config), user_proj, path);
+            let worktrees = project.list_worktrees()?;
+            for wt in worktrees {
+                found_any = true;
+                let dir_name = wt
+                    .path
+                    .file_name()
+                    .map(|s| s.to_string_lossy())
+                    .unwrap_or_default();
+                let branch = wt.branch.as_deref().unwrap_or("(detached)");
+                println!("{name}-{dir_name}\t{branch}\t{}", wt.path.display());
+            }
+        }
+    }
+
+    // 3. If filter was provided and nothing found, check validity
     if !found_any {
-        if let Some(name) = project_filter {
-            println!("No worktrees found for project '{name}'");
+        if let Some(filter) = project_filter {
+            if !config.projects.contains_key(filter) {
+                // Reuse the cached auto-detection result instead of re-running discover()
+                let auto_name = auto_detected.map(|(rc, root)| rc.effective_name(&root));
+                if auto_name.as_deref() != Some(filter) {
+                    return Err(Error::ProjectNotFound(filter.to_string()));
+                }
+            }
+            println!("No worktrees found for project '{filter}'");
         } else {
             println!("No worktrees found");
         }
@@ -606,10 +710,15 @@ fn cleanup_and_remove_worktree(
 fn cmd_worktree_rm(name: &str) -> Result<()> {
     let config = Config::load()?;
 
-    // Collect all worktrees across all projects
-    let mut matches: Vec<(&str, &config::Project, config::Worktree)> = Vec::new();
+    let mut matches: Vec<(String, config::Project, config::Worktree)> = Vec::new();
+    // Track seen repo paths (not names) to deduplicate when registered name ≠ effective_name()
+    let mut seen_repo_paths = std::collections::HashSet::new();
 
+    // 1. Search registered projects
     for (project_name, project) in &config.projects {
+        if let Ok(canonical) = project.path.canonicalize() {
+            seen_repo_paths.insert(canonical);
+        }
         let worktrees = project.list_worktrees()?;
         for wt in worktrees {
             let dir_name = wt
@@ -618,25 +727,52 @@ fn cmd_worktree_rm(name: &str) -> Result<()> {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            // Check for exact full name match (project-dirname)
             let full_name = format!("{project_name}-{dir_name}");
             if full_name == name {
-                // Exact match - use this one
                 return cleanup_and_remove_worktree(project_name, project, &wt);
             }
 
-            // Check if dirname matches
             if dir_name == name {
-                matches.push((project_name, project, wt));
+                matches.push((project_name.clone(), project.clone(), wt));
             }
         }
     }
 
+    // 2. Also search auto-detected project from cwd
+    let cwd = std::env::current_dir()?;
+    if let Some((repo_config, repo_root)) = config::RepoConfig::discover(&cwd)? {
+        // Deduplicate by repo path — covers the case where registered name ≠ effective_name()
+        if !seen_repo_paths.contains(&repo_root) {
+            let proj_name = repo_config.effective_name(&repo_root);
+            let user_proj = config.projects.get(&proj_name);
+            let path = user_proj.map(|p| p.path.clone()).unwrap_or(repo_root);
+            let project = config::merge_project(Some(&repo_config), user_proj, path);
+            let worktrees = project.list_worktrees()?;
+            for wt in worktrees {
+                let dir_name = wt
+                    .path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let full_name = format!("{proj_name}-{dir_name}");
+                if full_name == name {
+                    return cleanup_and_remove_worktree(&proj_name, &project, &wt);
+                }
+
+                if dir_name == name {
+                    matches.push((proj_name.clone(), project.clone(), wt));
+                }
+            }
+        }
+    }
+
+    // 3. Handle matches
     match matches.len() {
         0 => Err(Error::WorktreeNotFound(name.to_string())),
         1 => {
             let (project_name, project, wt) = matches.remove(0);
-            cleanup_and_remove_worktree(project_name, project, &wt)
+            cleanup_and_remove_worktree(&project_name, &project, &wt)
         }
         _ => {
             let candidates: Vec<String> = matches
