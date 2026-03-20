@@ -615,13 +615,18 @@ fn open_editor(path: &std::path::Path) -> Result<()> {
 
     if !status.success() {
         let editor = std::env::var("EDITOR").unwrap_or_default();
-        return Err(Error::EditorFailed(editor, status.code()));
+        let code = status
+            .code()
+            .map_or_else(|| "unknown".to_string(), |c| c.to_string());
+        return Err(Error::EditorFailed(editor, code));
     }
 
     Ok(())
 }
 
 fn cmd_start(project: &str, name: &str) -> Result<()> {
+    validate_worktree_name(name)?;
+
     let config = Config::load()?;
     let (project_name, resolved_project, _repo_env) =
         config::resolve_project(&config, Some(project))?;

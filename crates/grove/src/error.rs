@@ -76,6 +76,6 @@ pub enum Error {
     #[error("Post-create hook failed: `{0}`\n{1}")]
     HookFailed(String, String),
 
-    #[error("Editor '{0}' exited with status {1:?}")]
-    EditorFailed(String, Option<i32>),
+    #[error("Editor '{0}' exited with status {1}")]
+    EditorFailed(String, String),
 }
