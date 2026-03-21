@@ -5,6 +5,7 @@ use clap::Parser;
 
 mod config;
 mod error;
+mod vcs;
 
 use config::{Config, EnvVars, ProjectRef};
 use error::{Error, Result};
@@ -13,7 +14,11 @@ const MISE_METADATA_LUA: &str = include_str!("mise_plugin/metadata.lua");
 const MISE_ENV_LUA: &str = include_str!("mise_plugin/mise_env.lua");
 
 #[derive(Parser)]
-#[command(name = "grove", version, about = "Manage a grove of git repositories")]
+#[command(
+    name = "grove",
+    version,
+    about = "Manage a grove of git/jj repositories"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -40,8 +45,11 @@ enum Commands {
         #[command(subcommand)]
         command: EnvCommands,
     },
-    /// Manage git worktrees
+    /// Manage git/jj worktrees
     Worktree {
+        /// Force a specific VCS backend (e.g., "git") instead of auto-detection
+        #[arg(long)]
+        vcs: Option<String>,
         #[command(subcommand)]
         command: WorktreeCommands,
     },
@@ -51,6 +59,9 @@ enum Commands {
         project: String,
         /// Worktree name
         name: String,
+        /// Force a specific VCS backend (e.g., "git") instead of auto-detection
+        #[arg(long)]
+        vcs: Option<String>,
     },
     /// Install grove plugin for mise
     InitMise,
@@ -135,15 +146,23 @@ fn run(command: Commands) -> Result<()> {
             EnvCommands::Export { json, path } => cmd_env_export(path, json),
         },
         Commands::InitMise => cmd_init_mise(),
-        Commands::Start { project, name } => cmd_start(&project, &name),
-        Commands::Worktree { command } => match command {
-            WorktreeCommands::New {
-                name_or_project,
-                name,
-            } => cmd_worktree_new(&name_or_project, name.as_deref()),
-            WorktreeCommands::List { project } => cmd_worktree_list(project.as_deref()),
-            WorktreeCommands::Rm { name } => cmd_worktree_rm(&name),
-        },
+        Commands::Start { project, name, vcs } => {
+            let vcs_override = parse_vcs_override(vcs.as_deref())?;
+            cmd_start(&project, &name, vcs_override)
+        }
+        Commands::Worktree { vcs, command } => {
+            let vcs_override = parse_vcs_override(vcs.as_deref())?;
+            match command {
+                WorktreeCommands::New {
+                    name_or_project,
+                    name,
+                } => cmd_worktree_new(&name_or_project, name.as_deref(), vcs_override),
+                WorktreeCommands::List { project } => {
+                    cmd_worktree_list(project.as_deref(), vcs_override)
+                }
+                WorktreeCommands::Rm { name } => cmd_worktree_rm(&name, vcs_override),
+            }
+        }
     }
 }
 
@@ -393,13 +412,22 @@ fn cmd_env_export(path: PathBuf, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn parse_vcs_override(vcs: Option<&str>) -> Result<Option<vcs::VcsOverride>> {
+    match vcs.map(str::to_lowercase).as_deref() {
+        None => Ok(None),
+        Some("git") => Ok(Some(vcs::VcsOverride::Git)),
+        Some(other) => Err(Error::InvalidVcsOverride(other.to_string())),
+    }
+}
+
 /// Validate that a worktree actually exists for a project.
 fn validate_worktree_exists(
     project: &config::Project,
     project_name: &str,
     worktree_name: &str,
 ) -> Result<()> {
-    let worktrees = project.list_worktrees()?;
+    let backend = vcs::detect_backend(&project.path, None)?;
+    let worktrees = backend.list_worktrees(&project.path, &project.worktree_base())?;
     let exists = worktrees.iter().any(|wt| {
         wt.path
             .file_name()
@@ -518,6 +546,7 @@ fn create_worktree_with_hooks(
     project_name: &str,
     project: &config::Project,
     worktree_name: &str,
+    vcs_override: Option<vcs::VcsOverride>,
 ) -> Result<std::path::PathBuf> {
     validate_worktree_name(worktree_name)?;
 
@@ -532,39 +561,8 @@ fn create_worktree_with_hooks(
         std::fs::create_dir_all(&worktree_base)?;
     }
 
-    let output = std::process::Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            worktree_path.to_str().unwrap(),
-            "-b",
-            worktree_name,
-        ])
-        .current_dir(&project.path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("already exists") {
-            let output2 = std::process::Command::new("git")
-                .args([
-                    "worktree",
-                    "add",
-                    worktree_path.to_str().unwrap(),
-                    worktree_name,
-                ])
-                .current_dir(&project.path)
-                .output()?;
-
-            if !output2.status.success() {
-                return Err(Error::GitCommandFailed(
-                    String::from_utf8_lossy(&output2.stderr).to_string(),
-                ));
-            }
-        } else {
-            return Err(Error::GitCommandFailed(stderr.to_string()));
-        }
-    }
+    let backend = vcs::detect_backend(&project.path, vcs_override)?;
+    backend.create_worktree(&project.path, &worktree_path, worktree_name)?;
 
     println!("Created worktree at {}", worktree_path.display());
 
@@ -624,7 +622,7 @@ fn open_editor(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_start(project: &str, name: &str) -> Result<()> {
+fn cmd_start(project: &str, name: &str, vcs_override: Option<vcs::VcsOverride>) -> Result<()> {
     validate_worktree_name(name)?;
 
     let config = Config::load()?;
@@ -633,23 +631,29 @@ fn cmd_start(project: &str, name: &str) -> Result<()> {
 
     let worktree_path = resolved_project.worktree_base().join(name);
 
-    if worktree_path.exists() && worktree_path.join(".git").exists() {
+    if worktree_path.exists()
+        && (worktree_path.join(".git").exists() || worktree_path.join(".jj").exists())
+    {
         // Valid existing worktree — reuse it
         eprintln!("worktree '{name}' already exists for {project_name}, reusing");
     } else {
-        // Either doesn't exist, or is an orphaned directory without .git
+        // Either doesn't exist, or is an orphaned directory without .git/.jj
         if worktree_path.exists() {
             // Orphaned directory — clean up before recreating
             std::fs::remove_dir_all(&worktree_path)?;
         }
-        create_worktree_with_hooks(&project_name, &resolved_project, name)?;
+        create_worktree_with_hooks(&project_name, &resolved_project, name, vcs_override)?;
     }
 
     open_editor(&worktree_path)?;
     Ok(())
 }
 
-fn cmd_worktree_new(name_or_project: &str, name: Option<&str>) -> Result<()> {
+fn cmd_worktree_new(
+    name_or_project: &str,
+    name: Option<&str>,
+    vcs_override: Option<vcs::VcsOverride>,
+) -> Result<()> {
     let (explicit_project, worktree_name) = match name {
         Some(wt_name) => (Some(name_or_project), wt_name),
         None => (None, name_or_project),
@@ -658,11 +662,14 @@ fn cmd_worktree_new(name_or_project: &str, name: Option<&str>) -> Result<()> {
     let config = Config::load()?;
     let (project_name, project, _repo_env) = config::resolve_project(&config, explicit_project)?;
 
-    create_worktree_with_hooks(&project_name, &project, worktree_name)?;
+    create_worktree_with_hooks(&project_name, &project, worktree_name, vcs_override)?;
     Ok(())
 }
 
-fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
+fn cmd_worktree_list(
+    project_filter: Option<&str>,
+    vcs_override: Option<vcs::VcsOverride>,
+) -> Result<()> {
     let config = Config::load()?;
 
     let mut found_any = false;
@@ -680,7 +687,8 @@ fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
         if let Ok(canonical) = project.path.canonicalize() {
             seen_repo_paths.insert(canonical);
         }
-        let worktrees = project.list_worktrees()?;
+        let backend = vcs::detect_backend(&project.path, vcs_override)?;
+        let worktrees = backend.list_worktrees(&project.path, &project.worktree_base())?;
         for wt in worktrees {
             found_any = true;
             let dir_name = wt
@@ -688,7 +696,7 @@ fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
                 .file_name()
                 .map(|s| s.to_string_lossy())
                 .unwrap_or_default();
-            let branch = wt.branch.as_deref().unwrap_or("(detached)");
+            let branch = wt.branch.as_deref().map_or("(jj workspace)", |b| b);
             println!("{project_name}-{dir_name}\t{branch}\t{}", wt.path.display());
         }
     }
@@ -709,7 +717,8 @@ fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
             let user_proj = config.projects.get(&name);
             let path = user_proj.map_or_else(|| repo_root.clone(), |p| p.path.clone());
             let project = config::merge_project(Some(repo_config), user_proj, path);
-            let worktrees = project.list_worktrees()?;
+            let backend = vcs::detect_backend(&project.path, vcs_override)?;
+            let worktrees = backend.list_worktrees(&project.path, &project.worktree_base())?;
             for wt in worktrees {
                 found_any = true;
                 let dir_name = wt
@@ -717,7 +726,7 @@ fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
                     .file_name()
                     .map(|s| s.to_string_lossy())
                     .unwrap_or_default();
-                let branch = wt.branch.as_deref().unwrap_or("(detached)");
+                let branch = wt.branch.as_deref().map_or("(jj workspace)", |b| b);
                 println!("{name}-{dir_name}\t{branch}\t{}", wt.path.display());
             }
         }
@@ -745,7 +754,8 @@ fn cmd_worktree_list(project_filter: Option<&str>) -> Result<()> {
 fn cleanup_and_remove_worktree(
     project_name: &str,
     project: &config::Project,
-    wt: &config::Worktree,
+    wt: &vcs::WorktreeInfo,
+    vcs_override: Option<vcs::VcsOverride>,
 ) -> Result<()> {
     // Extract worktree dir name before removal (directory may be gone after)
     let worktree_dir_name = wt
@@ -761,7 +771,9 @@ fn cleanup_and_remove_worktree(
         println!("Dropped database '{db_name}'");
     }
 
-    remove_worktree(project, &wt.path)?;
+    let backend = vcs::detect_backend(&project.path, vcs_override)?;
+    backend.remove_worktree(&project.path, &wt.path, &worktree_dir_name)?;
+    println!("Removed worktree at {}", wt.path.display());
 
     if project.database.is_some() {
         let override_path = config::worktree_env_path(project_name, &worktree_dir_name)?;
@@ -773,10 +785,10 @@ fn cleanup_and_remove_worktree(
     Ok(())
 }
 
-fn cmd_worktree_rm(name: &str) -> Result<()> {
+fn cmd_worktree_rm(name: &str, vcs_override: Option<vcs::VcsOverride>) -> Result<()> {
     let config = Config::load()?;
 
-    let mut matches: Vec<(String, config::Project, config::Worktree)> = Vec::new();
+    let mut matches: Vec<(String, config::Project, vcs::WorktreeInfo)> = Vec::new();
     // Track seen repo paths (not names) to deduplicate when registered name ≠ effective_name()
     let mut seen_repo_paths = std::collections::HashSet::new();
 
@@ -785,7 +797,8 @@ fn cmd_worktree_rm(name: &str) -> Result<()> {
         if let Ok(canonical) = project.path.canonicalize() {
             seen_repo_paths.insert(canonical);
         }
-        let worktrees = project.list_worktrees()?;
+        let backend = vcs::detect_backend(&project.path, vcs_override)?;
+        let worktrees = backend.list_worktrees(&project.path, &project.worktree_base())?;
         for wt in worktrees {
             let dir_name = wt
                 .path
@@ -795,7 +808,7 @@ fn cmd_worktree_rm(name: &str) -> Result<()> {
 
             let full_name = format!("{project_name}-{dir_name}");
             if full_name == name {
-                return cleanup_and_remove_worktree(project_name, project, &wt);
+                return cleanup_and_remove_worktree(project_name, project, &wt, vcs_override);
             }
 
             if dir_name == name {
@@ -813,7 +826,8 @@ fn cmd_worktree_rm(name: &str) -> Result<()> {
             let user_proj = config.projects.get(&proj_name);
             let path = user_proj.map(|p| p.path.clone()).unwrap_or(repo_root);
             let project = config::merge_project(Some(&repo_config), user_proj, path);
-            let worktrees = project.list_worktrees()?;
+            let backend = vcs::detect_backend(&project.path, vcs_override)?;
+            let worktrees = backend.list_worktrees(&project.path, &project.worktree_base())?;
             for wt in worktrees {
                 let dir_name = wt
                     .path
@@ -823,7 +837,7 @@ fn cmd_worktree_rm(name: &str) -> Result<()> {
 
                 let full_name = format!("{proj_name}-{dir_name}");
                 if full_name == name {
-                    return cleanup_and_remove_worktree(&proj_name, &project, &wt);
+                    return cleanup_and_remove_worktree(&proj_name, &project, &wt, vcs_override);
                 }
 
                 if dir_name == name {
@@ -838,7 +852,7 @@ fn cmd_worktree_rm(name: &str) -> Result<()> {
         0 => Err(Error::WorktreeNotFound(name.to_string())),
         1 => {
             let (project_name, project, wt) = matches.remove(0);
-            cleanup_and_remove_worktree(&project_name, &project, &wt)
+            cleanup_and_remove_worktree(&project_name, &project, &wt, vcs_override)
         }
         _ => {
             let candidates: Vec<String> = matches
@@ -858,22 +872,6 @@ fn cmd_worktree_rm(name: &str) -> Result<()> {
             ))
         }
     }
-}
-
-fn remove_worktree(project: &config::Project, worktree_path: &std::path::Path) -> Result<()> {
-    let output = std::process::Command::new("git")
-        .args(["worktree", "remove", worktree_path.to_str().unwrap()])
-        .current_dir(&project.path)
-        .output()?;
-
-    if !output.status.success() {
-        return Err(Error::GitCommandFailed(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-
-    println!("Removed worktree at {}", worktree_path.display());
-    Ok(())
 }
 
 fn mise_data_dir() -> Result<PathBuf> {
