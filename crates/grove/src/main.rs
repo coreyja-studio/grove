@@ -696,7 +696,10 @@ fn cmd_worktree_list(
                 .file_name()
                 .map(|s| s.to_string_lossy())
                 .unwrap_or_default();
-            let branch = wt.branch.as_deref().map_or("(jj workspace)", |b| b);
+            let branch = wt.branch.as_deref().unwrap_or(match wt.vcs_kind {
+                vcs::VcsKind::Git => "(detached)",
+                vcs::VcsKind::Jj => "(jj workspace)",
+            });
             println!("{project_name}-{dir_name}\t{branch}\t{}", wt.path.display());
         }
     }
@@ -726,7 +729,10 @@ fn cmd_worktree_list(
                     .file_name()
                     .map(|s| s.to_string_lossy())
                     .unwrap_or_default();
-                let branch = wt.branch.as_deref().map_or("(jj workspace)", |b| b);
+                let branch = wt.branch.as_deref().unwrap_or(match wt.vcs_kind {
+                    vcs::VcsKind::Git => "(detached)",
+                    vcs::VcsKind::Jj => "(jj workspace)",
+                });
                 println!("{name}-{dir_name}\t{branch}\t{}", wt.path.display());
             }
         }

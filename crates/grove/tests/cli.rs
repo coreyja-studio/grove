@@ -2900,10 +2900,11 @@ mod jj_workspace {
             .assert()
             .success();
 
-        // Run with a PATH that only has basic system dirs (no jj)
+        // Run with a PATH that excludes jj — use a nonexistent directory
+        // so no VCS binaries are found (grove binary is invoked by absolute path)
         grove_cmd(&config_dir)
             .args(["worktree", "new", "fakejj", "test-ws"])
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", "/nonexistent")
             .assert()
             .failure()
             .stderr(predicate::str::contains("jj is not installed"))

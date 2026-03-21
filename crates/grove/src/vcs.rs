@@ -2,10 +2,18 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
+/// Which VCS backend produced this worktree entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcsKind {
+    Git,
+    Jj,
+}
+
 /// Information about a worktree/workspace managed by a VCS backend.
 pub struct WorktreeInfo {
     pub path: PathBuf,
     pub branch: Option<String>,
+    pub vcs_kind: VcsKind,
 }
 
 /// Override for VCS backend selection via `--vcs` flag.
@@ -129,6 +137,7 @@ impl VcsBackend for GitBackend {
                         worktrees.push(WorktreeInfo {
                             path,
                             branch: current_branch.take(),
+                            vcs_kind: VcsKind::Git,
                         });
                     }
                     is_first = false;
@@ -145,6 +154,7 @@ impl VcsBackend for GitBackend {
                 worktrees.push(WorktreeInfo {
                     path,
                     branch: current_branch,
+                    vcs_kind: VcsKind::Git,
                 });
             }
         }
@@ -226,6 +236,7 @@ impl VcsBackend for JjBackend {
             worktrees.push(WorktreeInfo {
                 path: worktree_base.join(name),
                 branch: None,
+                vcs_kind: VcsKind::Jj,
             });
         }
 
