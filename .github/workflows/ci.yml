@@ -15,61 +15,93 @@ jobs:
   test:
     uses: ./.github/workflows/_test.yml
 
-  build-linux:
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: [fmt, clippy, test]
-    uses: ./.github/workflows/_build.yml
-    with:
-      target: x86_64-unknown-linux-gnu
-      os: ubuntu-latest
+  pr-title:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title follows conventional commits
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?(!)?: .+'
+          if [[ "$PR_TITLE" =~ $pattern ]]; then
+            echo "PR title follows conventional commits: $PR_TITLE"
+          else
+            echo "PR title does not follow conventional commits"
+            echo ""
+            echo "  Got: $PR_TITLE"
+            echo "  Expected format: <type>[optional scope][!]: <description>"
+            echo "  Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+            exit 1
+          fi
 
-  build-macos-x86:
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: [fmt, clippy, test]
-    uses: ./.github/workflows/_build.yml
-    with:
-      target: x86_64-apple-darwin
-      os: macos-latest
+  ready:
+    if: always()
+    needs: [fmt, clippy, test, pr-title]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          if [[ "${{ needs.fmt.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.clippy.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.test.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.pr-title.result }}" != "success" && "${{ needs.pr-title.result }}" != "skipped" ]]; then exit 1; fi
 
-  build-macos-arm:
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: [fmt, clippy, test]
-    uses: ./.github/workflows/_build.yml
-    with:
-      target: aarch64-apple-darwin
-      os: macos-latest
-
-  release:
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    name: Create Release
-    needs: [build-linux, build-macos-x86, build-macos-arm]
+  release-please:
+    if: always() && needs.ready.result == 'success' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [ready]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.rp.outputs['crates/grove--release_created'] }}
+      tag_name: ${{ steps.rp.outputs['crates/grove--tag_name'] }}
+      version: ${{ steps.rp.outputs['crates/grove--version'] }}
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
+      - uses: googleapis/release-please-action@v4
+        id: rp
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+  build:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get version
-        id: version
-        run: |
-          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "grove") | .version')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/download-artifact@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          path: artifacts
+          targets: ${{ matrix.target }}
 
-      - name: Prepare release assets
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p release
-          mv artifacts/*/*.tar.gz release/
-
-      - name: Create or update release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: v${{ steps.version.outputs.version }}
-          files: release/*
-          generate_release_notes: true
-          make_latest: true
+          BINARY=target/${{ matrix.target }}/release/grove
+          ARCHIVE=grove-${{ needs.release-please.outputs.tag_name }}-${{ matrix.target }}.tar.gz
+          tar czf "$ARCHIVE" -C "$(dirname "$BINARY")" "$(basename "$BINARY")"
+          gh release upload "${{ needs.release-please.outputs.tag_name }}" "$ARCHIVE"
