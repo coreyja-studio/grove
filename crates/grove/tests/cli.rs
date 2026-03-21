@@ -1993,6 +1993,242 @@ post_create = [{hooks_array}]
     }
 }
 
+mod start {
+    use super::*;
+
+    #[test]
+    fn test_start_creates_worktree_and_skips_editor_when_unset() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["start", "myproject", "my-feature"])
+            .env_remove("EDITOR")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Created worktree"));
+
+        let worktree_path = repo.join(".worktrees/my-feature");
+        assert!(worktree_path.exists(), "Worktree should be created");
+        assert!(
+            worktree_path.join(".git").exists(),
+            "Worktree should have .git"
+        );
+    }
+
+    #[test]
+    fn test_start_reuses_existing_worktree() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // First start - creates worktree
+        grove_cmd(&config_dir)
+            .args(["start", "myproject", "my-feature"])
+            .env_remove("EDITOR")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Created worktree"));
+
+        // Second start - reuses worktree
+        grove_cmd(&config_dir)
+            .args(["start", "myproject", "my-feature"])
+            .env_remove("EDITOR")
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("already exists"))
+            .stderr(predicate::str::contains("reusing"));
+    }
+
+    #[test]
+    fn test_start_runs_hooks_on_creation() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+        let canonical = repo.canonicalize().unwrap();
+
+        let config_content = format!(
+            r#"[projects.myproject]
+path = "{}"
+
+[projects.myproject.hooks]
+post_create = ["touch .hook-marker"]
+"#,
+            canonical.display()
+        );
+        fs::write(config_dir.path().join("config.toml"), config_content).unwrap();
+
+        grove_cmd(&config_dir)
+            .args(["start", "myproject", "hooktest"])
+            .env_remove("EDITOR")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Running hook"))
+            .stdout(predicate::str::contains("Hook completed"));
+
+        let marker = canonical.join(".worktrees/hooktest/.hook-marker");
+        assert!(marker.exists(), "Hook should have created marker file");
+    }
+
+    #[test]
+    fn test_start_skips_hooks_on_reuse() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+        let canonical = repo.canonicalize().unwrap();
+
+        let config_content = format!(
+            r#"[projects.myproject]
+path = "{}"
+
+[projects.myproject.hooks]
+post_create = ["touch .hook-marker"]
+"#,
+            canonical.display()
+        );
+        fs::write(config_dir.path().join("config.toml"), config_content).unwrap();
+
+        // First start - hooks run
+        grove_cmd(&config_dir)
+            .args(["start", "myproject", "hookskip"])
+            .env_remove("EDITOR")
+            .assert()
+            .success();
+
+        // Remove marker to prove hooks don't re-run
+        let marker = canonical.join(".worktrees/hookskip/.hook-marker");
+        fs::remove_file(&marker).unwrap();
+
+        // Second start - hooks should NOT run
+        grove_cmd(&config_dir)
+            .args(["start", "myproject", "hookskip"])
+            .env_remove("EDITOR")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Running hook").not());
+
+        assert!(!marker.exists(), "Hook should NOT have re-run");
+    }
+
+    #[test]
+    fn test_start_hook_failure_prevents_editor() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+        let canonical = repo.canonicalize().unwrap();
+
+        let config_content = format!(
+            r#"[projects.myproject]
+path = "{}"
+
+[projects.myproject.hooks]
+post_create = ["false"]
+"#,
+            canonical.display()
+        );
+        fs::write(config_dir.path().join("config.toml"), config_content).unwrap();
+
+        grove_cmd(&config_dir)
+            .args(["start", "myproject", "failhook"])
+            .env("EDITOR", "echo")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("Post-create hook failed"));
+    }
+
+    #[test]
+    fn test_start_project_not_found() {
+        let config_dir = TempDir::new().unwrap();
+
+        grove_cmd(&config_dir)
+            .args(["start", "nonexistent", "feature"])
+            .env_remove("EDITOR")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("not found"));
+    }
+
+    #[test]
+    fn test_start_with_editor() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Use "true" as a no-op editor to verify the editor path executes
+        grove_cmd(&config_dir)
+            .args(["start", "myproject", "editfeat"])
+            .env("EDITOR", "true")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_start_recreates_orphaned_worktree_directory() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Create an orphaned directory (no .git file inside)
+        let worktree_path = repo.join(".worktrees/orphaned");
+        fs::create_dir_all(&worktree_path).unwrap();
+        assert!(!worktree_path.join(".git").exists(), "Should have no .git");
+
+        // grove start should clean up orphaned dir and create a real worktree
+        grove_cmd(&config_dir)
+            .args(["start", "myproject", "orphaned"])
+            .env_remove("EDITOR")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Created worktree"));
+
+        assert!(
+            worktree_path.join(".git").exists(),
+            "Should now have .git file"
+        );
+    }
+
+    #[test]
+    fn test_start_editor_with_arguments() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Simulate EDITOR with arguments (like "code --wait")
+        // "true --ignored-flag" works — true ignores all arguments
+        grove_cmd(&config_dir)
+            .args(["start", "myproject", "argfeat"])
+            .env("EDITOR", "true --some-flag")
+            .assert()
+            .success();
+    }
+}
+
 mod init_mise {
     use super::*;
 

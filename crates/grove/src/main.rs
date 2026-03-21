@@ -45,6 +45,13 @@ enum Commands {
         #[command(subcommand)]
         command: WorktreeCommands,
     },
+    /// Create a worktree, run hooks, and open editor
+    Start {
+        /// Project name
+        project: String,
+        /// Worktree name
+        name: String,
+    },
     /// Install grove plugin for mise
     InitMise,
 }
@@ -128,6 +135,7 @@ fn run(command: Commands) -> Result<()> {
             EnvCommands::Export { json, path } => cmd_env_export(path, json),
         },
         Commands::InitMise => cmd_init_mise(),
+        Commands::Start { project, name } => cmd_start(&project, &name),
         Commands::Worktree { command } => match command {
             WorktreeCommands::New {
                 name_or_project,
@@ -506,16 +514,12 @@ fn run_post_create_hooks(hooks: &[String], worktree_path: &std::path::Path) -> R
     Ok(())
 }
 
-fn cmd_worktree_new(name_or_project: &str, name: Option<&str>) -> Result<()> {
-    let (explicit_project, worktree_name) = match name {
-        Some(wt_name) => (Some(name_or_project), wt_name),
-        None => (None, name_or_project),
-    };
-
+fn create_worktree_with_hooks(
+    project_name: &str,
+    project: &config::Project,
+    worktree_name: &str,
+) -> Result<std::path::PathBuf> {
     validate_worktree_name(worktree_name)?;
-
-    let config = Config::load()?;
-    let (project_name, project, _repo_env) = config::resolve_project(&config, explicit_project)?;
 
     let worktree_base = project.worktree_base();
     let worktree_path = worktree_base.join(worktree_name);
@@ -565,17 +569,17 @@ fn cmd_worktree_new(name_or_project: &str, name: Option<&str>) -> Result<()> {
     println!("Created worktree at {}", worktree_path.display());
 
     if let Some(db_config) = &project.database {
-        let db_name = db_config.db_name(&project_name, worktree_name);
+        let db_name = db_config.db_name(project_name, worktree_name);
         println!("Creating database '{db_name}'...");
         create_database(&db_name)?;
         println!("Created database '{db_name}'");
 
-        let db_url = db_config.database_url(&project_name, worktree_name);
+        let db_url = db_config.database_url(project_name, worktree_name);
         let env_var = db_config.env_var_name();
 
-        let mut env_vars = EnvVars::load_worktree(&project_name, worktree_name)?;
+        let mut env_vars = EnvVars::load_worktree(project_name, worktree_name)?;
         env_vars.set(env_var.to_string(), db_url.clone());
-        env_vars.save_worktree(&project_name, worktree_name)?;
+        env_vars.save_worktree(project_name, worktree_name)?;
         println!("Set {env_var} for worktree '{project_name}/{worktree_name}'");
 
         if let Some(cmd) = &db_config.setup_command {
@@ -593,6 +597,68 @@ fn cmd_worktree_new(name_or_project: &str, name: Option<&str>) -> Result<()> {
         }
     }
 
+    Ok(worktree_path)
+}
+
+/// Opens `$EDITOR` pointed at the given path, if `$EDITOR` is set.
+///
+/// Uses `sh -c` to support editors with arguments (e.g., `EDITOR="code --wait"`).
+/// If `$EDITOR` is not set, returns `Ok(())` silently.
+fn open_editor(path: &std::path::Path) -> Result<()> {
+    if std::env::var_os("EDITOR").is_none() {
+        return Ok(());
+    }
+
+    let status = std::process::Command::new("sh")
+        .args(["-c", r#"$EDITOR "$@""#, "--", path.to_str().unwrap()])
+        .status()?;
+
+    if !status.success() {
+        let editor = std::env::var("EDITOR").unwrap_or_default();
+        let code = status
+            .code()
+            .map_or_else(|| "unknown".to_string(), |c| c.to_string());
+        return Err(Error::EditorFailed(editor, code));
+    }
+
+    Ok(())
+}
+
+fn cmd_start(project: &str, name: &str) -> Result<()> {
+    validate_worktree_name(name)?;
+
+    let config = Config::load()?;
+    let (project_name, resolved_project, _repo_env) =
+        config::resolve_project(&config, Some(project))?;
+
+    let worktree_path = resolved_project.worktree_base().join(name);
+
+    if worktree_path.exists() && worktree_path.join(".git").exists() {
+        // Valid existing worktree — reuse it
+        eprintln!("worktree '{name}' already exists for {project_name}, reusing");
+    } else {
+        // Either doesn't exist, or is an orphaned directory without .git
+        if worktree_path.exists() {
+            // Orphaned directory — clean up before recreating
+            std::fs::remove_dir_all(&worktree_path)?;
+        }
+        create_worktree_with_hooks(&project_name, &resolved_project, name)?;
+    }
+
+    open_editor(&worktree_path)?;
+    Ok(())
+}
+
+fn cmd_worktree_new(name_or_project: &str, name: Option<&str>) -> Result<()> {
+    let (explicit_project, worktree_name) = match name {
+        Some(wt_name) => (Some(name_or_project), wt_name),
+        None => (None, name_or_project),
+    };
+
+    let config = Config::load()?;
+    let (project_name, project, _repo_env) = config::resolve_project(&config, explicit_project)?;
+
+    create_worktree_with_hooks(&project_name, &project, worktree_name)?;
     Ok(())
 }
 
