@@ -16,8 +16,8 @@ pub enum Error {
     #[error("Path not found: {0}")]
     PathNotFound(PathBuf),
 
-    #[error("Path is not a git repository: {0}")]
-    NotGitRepo(PathBuf),
+    #[error("Path is not a git/jj repository: {0}")]
+    NotVcsRepo(PathBuf),
 
     #[error("Path does not belong to any registered project: {0}")]
     NoProjectForPath(PathBuf),
@@ -28,8 +28,14 @@ pub enum Error {
     #[error("Invalid KEY=value format: {0}")]
     InvalidEnvFormat(String),
 
-    #[error("Git command failed: {0}")]
-    GitCommandFailed(String),
+    #[error("VCS command failed: {0}")]
+    VcsCommandFailed(String),
+
+    #[error("jj is not installed but this project uses jj workspaces (.jj directory found). Install jj or use --vcs git to force git mode")]
+    JjNotInstalled,
+
+    #[error("Unknown VCS backend '{0}'. Supported: git")]
+    InvalidVcsOverride(String),
 
     #[error("Worktree path already exists: {0}")]
     WorktreePathExists(PathBuf),

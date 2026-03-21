@@ -100,18 +100,27 @@ impl RepoConfig {
 
     /// Walk up from `path` looking for `.grove/config.toml`.
     /// Returns `(config, repo_root)` where the second element is the main repo root.
-    /// When `.git` is a file (worktree), reads it and resolves back to main repo root.
+    /// When `.git` is a file (git worktree) or `.jj/repo` is a symlink (jj workspace),
+    /// resolves back to the main repo root.
     pub fn discover(path: &Path) -> Result<Option<(Self, PathBuf)>> {
         let mut current = path.canonicalize()?;
         loop {
             if let Some(config) = Self::load_from_dir(&current)? {
                 let dot_git = current.join(".git");
                 if dot_git.is_file() {
+                    // Git worktree — resolve .git file to find main repo
                     if let Some(main_repo) = resolve_main_repo_from_dot_git_file(&dot_git)? {
                         return Ok(Some((config, main_repo)));
                     }
                     // Resolution failed — fall through to continue walking up
                 } else {
+                    // Check if this is a jj workspace (not the main repo)
+                    let dot_jj_repo = current.join(".jj").join("repo");
+                    if dot_jj_repo.is_symlink() {
+                        if let Some(main_repo) = resolve_main_repo_from_jj_workspace(&dot_jj_repo) {
+                            return Ok(Some((config, main_repo)));
+                        }
+                    }
                     return Ok(Some((config, current)));
                 }
             }
@@ -164,6 +173,20 @@ fn resolve_main_repo_from_dot_git_file(dot_git_file: &Path) -> Result<Option<Pat
     Ok(None)
 }
 
+/// Resolve a jj workspace's `.jj/repo` symlink to find the main repository root.
+///
+/// In a jj workspace, `.jj/repo` is a symlink pointing to `<main_repo>/.jj/repo`.
+fn resolve_main_repo_from_jj_workspace(dot_jj_repo: &Path) -> Option<PathBuf> {
+    let canonical = dot_jj_repo.canonicalize().ok()?;
+    // canonical points to <main_repo>/.jj/repo
+    let jj_dir = canonical.parent()?;
+    if jj_dir.file_name() == Some(std::ffi::OsStr::new(".jj")) {
+        jj_dir.parent().map(Path::to_path_buf)
+    } else {
+        None
+    }
+}
+
 pub fn merge_project(
     repo_config: Option<&RepoConfig>,
     user_project: Option<&Project>,
@@ -191,12 +214,6 @@ pub struct Project {
     pub hooks: Option<HooksConfig>,
 }
 
-#[derive(Debug)]
-pub struct Worktree {
-    pub path: PathBuf,
-    pub branch: Option<String>,
-}
-
 impl Project {
     /// Get the worktree base directory for this project.
     /// Returns the configured `worktree_base`, or defaults to `<project_path>/.worktrees`.
@@ -204,62 +221,6 @@ impl Project {
         self.worktree_base
             .clone()
             .unwrap_or_else(|| self.path.join(".worktrees"))
-    }
-
-    /// List all worktrees for this project by running `git worktree list --porcelain`.
-    /// Returns only secondary worktrees, not the main working directory.
-    pub fn list_worktrees(&self) -> Result<Vec<Worktree>> {
-        // Check if .git/worktrees exists - if not, no worktrees
-        if !self.path.join(".git/worktrees").exists() {
-            return Ok(Vec::new());
-        }
-
-        let output = std::process::Command::new("git")
-            .args(["worktree", "list", "--porcelain"])
-            .current_dir(&self.path)
-            .output()?;
-
-        if !output.status.success() {
-            return Err(Error::GitCommandFailed(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut worktrees = Vec::new();
-        let mut current_path: Option<PathBuf> = None;
-        let mut current_branch: Option<String> = None;
-        let mut is_first = true;
-
-        for line in stdout.lines() {
-            if let Some(path_str) = line.strip_prefix("worktree ") {
-                // Save previous worktree if any (skip first which is main repo)
-                if let Some(path) = current_path.take() {
-                    if !is_first {
-                        worktrees.push(Worktree {
-                            path,
-                            branch: current_branch.take(),
-                        });
-                    }
-                    is_first = false;
-                }
-                current_path = Some(PathBuf::from(path_str));
-                current_branch = None;
-            } else if let Some(branch_ref) = line.strip_prefix("branch refs/heads/") {
-                current_branch = Some(branch_ref.to_string());
-            }
-        }
-        // Don't forget the last worktree
-        if let Some(path) = current_path {
-            if !is_first {
-                worktrees.push(Worktree {
-                    path,
-                    branch: current_branch,
-                });
-            }
-        }
-
-        Ok(worktrees)
     }
 }
 
@@ -321,12 +282,12 @@ impl Config {
             return Err(Error::ProjectExists(name));
         }
 
-        // Validate path exists and is a git repo
+        // Validate path exists and is a git/jj repo
         if !path.exists() {
             return Err(Error::PathNotFound(path));
         }
-        if !path.join(".git").exists() {
-            return Err(Error::NotGitRepo(path));
+        if !path.join(".git").exists() && !path.join(".jj").exists() {
+            return Err(Error::NotVcsRepo(path));
         }
 
         let canonical = path.canonicalize()?;
@@ -352,25 +313,24 @@ impl Config {
     /// Find which project a path belongs to.
     ///
     /// Checks in order:
-    /// 1. Path is a subdirectory of one of the project's worktrees (more specific match)
+    /// 1. Path is a subdirectory of a project's worktree base (more specific match)
     /// 2. Path is a subdirectory of a project's main repo
     pub fn find_project_for_path(&self, path: &Path) -> Result<Option<ProjectRef>> {
         let canonical = path.canonicalize()?;
 
-        // First: check if path is in any project's worktree (more specific match)
+        // First: check if path is in any project's worktree base (more specific match)
         for (name, project) in &self.projects {
-            let worktrees = project.list_worktrees()?;
-            for wt in worktrees {
-                if canonical.starts_with(&wt.path) {
-                    let worktree_dir_name =
-                        wt.path.file_name().map(|n| n.to_string_lossy().to_string());
-                    let Some(wt_name) = worktree_dir_name else {
-                        continue;
-                    };
-                    return Ok(Some(ProjectRef {
-                        project: name.clone(),
-                        worktree: Some(wt_name),
-                    }));
+            let wt_base = project.worktree_base();
+            if let Ok(canonical_base) = wt_base.canonicalize() {
+                if canonical.starts_with(&canonical_base) {
+                    let rel = canonical.strip_prefix(&canonical_base).unwrap();
+                    if let Some(wt_dir) = rel.components().next() {
+                        let wt_name = wt_dir.as_os_str().to_string_lossy().to_string();
+                        return Ok(Some(ProjectRef {
+                            project: name.clone(),
+                            worktree: Some(wt_name),
+                        }));
+                    }
                 }
             }
         }
@@ -576,18 +536,21 @@ pub fn resolve_project_for_path(
         let proj_path = user_proj.map_or_else(|| repo_root.clone(), |p| p.path.clone());
         let merged = merge_project(Some(&repo_config), user_proj, proj_path);
 
-        // Note: discover() also canonicalizes internally, but doesn't expose the result.
-        // This second canonicalize is redundant but cheap — not worth changing the API for.
         let canonical = path.canonicalize()?;
         let worktree = {
-            let worktrees = merged.list_worktrees()?;
-            worktrees.into_iter().find_map(|wt| {
-                if canonical.starts_with(&wt.path) {
-                    wt.path.file_name().map(|n| n.to_string_lossy().to_string())
+            let wt_base = merged.worktree_base();
+            if let Ok(canonical_base) = wt_base.canonicalize() {
+                if canonical.starts_with(&canonical_base) {
+                    let rel = canonical.strip_prefix(&canonical_base).unwrap();
+                    rel.components()
+                        .next()
+                        .map(|c| c.as_os_str().to_string_lossy().to_string())
                 } else {
                     None
                 }
-            })
+            } else {
+                None
+            }
         };
 
         let repo_env = repo_config.env.unwrap_or_default();

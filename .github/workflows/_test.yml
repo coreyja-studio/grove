@@ -18,5 +18,15 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Install jj
+        run: |
+          JJ_URL=$(gh api repos/jj-vcs/jj/releases/latest \
+            --jq '.assets[] | select(.name | test("x86_64-unknown-linux-musl.tar.gz$")) | .browser_download_url')
+          curl -sSL "$JJ_URL" | tar xz
+          sudo mv jj /usr/local/bin/
+          jj --version
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Run tests
         run: cargo test --workspace

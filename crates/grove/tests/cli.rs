@@ -106,7 +106,7 @@ fn test_add_not_git_repo() {
         .args(["add", "test", not_repo.to_str().unwrap()])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not a git repository"));
+        .stderr(predicate::str::contains("not a git/jj repository"));
 }
 
 #[test]
@@ -2686,5 +2686,270 @@ FROM_REPO = "yes"
             .success()
             .stdout(predicate::str::contains("FROM_REPO"))
             .stdout(predicate::str::contains("yes"));
+    }
+}
+
+mod jj_workspace {
+    use super::*;
+
+    fn jj_available() -> bool {
+        Command::new("jj")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Creates a colocated jj repo with an initial commit.
+    /// Initial commit is required so `--vcs git` mode works (git worktree add needs at least one commit).
+    fn create_jj_repo(dir: &TempDir, name: &str) -> std::path::PathBuf {
+        let repo_path = dir.path().join(name);
+        fs::create_dir_all(&repo_path).unwrap();
+        Command::new("jj")
+            .args(["git", "init", "--colocate"])
+            .current_dir(&repo_path)
+            .output()
+            .expect("failed to run jj git init");
+        fs::write(repo_path.join("README.md"), "# Test\n").unwrap();
+        Command::new("jj")
+            .args(["commit", "-m", "initial"])
+            .current_dir(&repo_path)
+            .output()
+            .expect("failed to jj commit");
+        repo_path
+    }
+
+    #[test]
+    fn test_jj_workspace_new() {
+        if !jj_available() {
+            eprintln!("jj not installed, skipping");
+            return;
+        }
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo_path = create_jj_repo(&repos_dir, "jjproject");
+
+        // Register the project
+        grove_cmd(&config_dir)
+            .args(["add", "jjproject", repo_path.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Create a workspace
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "jjproject", "feature1"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Created worktree"));
+
+        // Verify workspace directory exists and has .jj
+        let wt_path = repo_path.join(".worktrees").join("feature1");
+        assert!(wt_path.exists(), "workspace directory should exist");
+        assert!(
+            wt_path.join(".jj").exists(),
+            "workspace should have .jj dir"
+        );
+    }
+
+    #[test]
+    fn test_jj_workspace_list() {
+        if !jj_available() {
+            eprintln!("jj not installed, skipping");
+            return;
+        }
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo_path = create_jj_repo(&repos_dir, "jjproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "jjproject", repo_path.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "jjproject", "feature1"])
+            .assert()
+            .success();
+
+        // List should show the workspace
+        grove_cmd(&config_dir)
+            .args(["worktree", "list", "jjproject"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("jjproject-feature1"))
+            .stdout(predicate::str::contains("(jj workspace)"));
+    }
+
+    #[test]
+    fn test_jj_workspace_rm() {
+        if !jj_available() {
+            eprintln!("jj not installed, skipping");
+            return;
+        }
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo_path = create_jj_repo(&repos_dir, "jjproject");
+
+        grove_cmd(&config_dir)
+            .args(["add", "jjproject", repo_path.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "jjproject", "feature1"])
+            .assert()
+            .success();
+
+        let wt_path = repo_path.join(".worktrees").join("feature1");
+        assert!(wt_path.exists());
+
+        // Remove the workspace
+        grove_cmd(&config_dir)
+            .args(["worktree", "rm", "jjproject-feature1"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Removed worktree"));
+
+        // Directory should be gone
+        assert!(!wt_path.exists(), "workspace directory should be removed");
+
+        // List should be empty
+        grove_cmd(&config_dir)
+            .args(["worktree", "list", "jjproject"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No worktrees found"));
+    }
+
+    #[test]
+    fn test_jj_autodetection() {
+        if !jj_available() {
+            eprintln!("jj not installed, skipping");
+            return;
+        }
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        // Colocated repo has both .jj and .git
+        let repo_path = create_jj_repo(&repos_dir, "colocated");
+
+        assert!(repo_path.join(".jj").exists(), "should have .jj");
+        assert!(repo_path.join(".git").exists(), "should have .git");
+
+        grove_cmd(&config_dir)
+            .args(["add", "colocated", repo_path.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Create workspace without --vcs flag — should auto-detect jj
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "colocated", "auto-test"])
+            .assert()
+            .success();
+
+        // jj workspace dir should have .jj, not a .git file
+        let wt_path = repo_path.join(".worktrees").join("auto-test");
+        assert!(
+            wt_path.join(".jj").exists(),
+            "auto-detected jj should create .jj workspace"
+        );
+    }
+
+    #[test]
+    fn test_vcs_git_override() {
+        if !jj_available() {
+            eprintln!("jj not installed, skipping");
+            return;
+        }
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo_path = create_jj_repo(&repos_dir, "colocated");
+
+        grove_cmd(&config_dir)
+            .args(["add", "colocated", repo_path.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Force git mode on a colocated repo
+        grove_cmd(&config_dir)
+            .args(["worktree", "--vcs", "git", "new", "colocated", "git-test"])
+            .assert()
+            .success();
+
+        // Git worktree should have a .git file (not directory)
+        let wt_path = repo_path.join(".worktrees").join("git-test");
+        assert!(
+            wt_path.join(".git").is_file(),
+            "git override should create git worktree with .git file"
+        );
+    }
+
+    #[test]
+    fn test_jj_not_installed_error() {
+        // Create a repo with a .jj directory but ensure jj binary can't be found.
+        // We simulate this by creating a fake .jj dir in a non-jj repo and using
+        // a PATH that excludes jj.
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo_path = repos_dir.path().join("fakejj");
+        fs::create_dir_all(&repo_path).unwrap();
+        fs::create_dir(repo_path.join(".git")).unwrap();
+        fs::create_dir(repo_path.join(".jj")).unwrap();
+
+        grove_cmd(&config_dir)
+            .args(["add", "fakejj", repo_path.to_str().unwrap()])
+            .assert()
+            .success();
+
+        // Run with a PATH that excludes jj — use a nonexistent directory
+        // so no VCS binaries are found (grove binary is invoked by absolute path)
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "fakejj", "test-ws"])
+            .env("PATH", "/nonexistent")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("jj is not installed"))
+            .stderr(predicate::str::contains("--vcs git"));
+    }
+
+    #[test]
+    fn test_jj_hooks_still_run() {
+        if !jj_available() {
+            eprintln!("jj not installed, skipping");
+            return;
+        }
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo_path = create_jj_repo(&repos_dir, "hookproject");
+
+        // Add .grove/config.toml with a hook
+        let grove_dir = repo_path.join(".grove");
+        fs::create_dir_all(&grove_dir).unwrap();
+        fs::write(
+            grove_dir.join("config.toml"),
+            r#"
+name = "hookproject"
+
+[hooks]
+post_create = ["touch hook-ran.txt"]
+"#,
+        )
+        .unwrap();
+
+        grove_cmd(&config_dir)
+            .args(["add", "hookproject", repo_path.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["worktree", "new", "hookproject", "with-hook"])
+            .assert()
+            .success();
+
+        // Verify the hook ran in the workspace directory
+        let wt_path = repo_path.join(".worktrees").join("with-hook");
+        assert!(
+            wt_path.join("hook-ran.txt").exists(),
+            "post-create hook should have run in jj workspace"
+        );
     }
 }
