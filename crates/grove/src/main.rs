@@ -17,7 +17,19 @@ const MISE_ENV_LUA: &str = include_str!("mise_plugin/mise_env.lua");
 #[command(
     name = "grove",
     version,
-    about = "Manage a grove of git/jj repositories"
+    about = "Manage a grove of git/jj repositories",
+    long_about = "Manage a grove of git/jj repositories.\n\n\
+        Grove tracks multiple git and jj repositories, manages isolated worktrees \
+        for each, and provides per-project and per-worktree environment variables. \
+        It integrates with mise to inject environment variables automatically.\n\n\
+        Projects can be registered explicitly with `grove add` or auto-detected \
+        from a .grove/config.toml file in the repository root. Worktrees are \
+        created in a configurable base directory and can have their own database \
+        instances and environment variable overrides.",
+    after_help = "Get started:\n  \
+        grove add myproject /path/to/repo\n  \
+        grove start myproject my-feature\n\n\
+        See `grove <command> --help` for detailed usage of each command."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,25 +39,76 @@ struct Cli {
 #[derive(clap::Subcommand)]
 enum Commands {
     /// Register an existing git repo
+    #[command(
+        long_about = "Register an existing git or jj repository with grove under a short name.\n\n\
+            The path must point to a directory containing a .git or .jj directory. \
+            The project name is used in all other grove commands to reference this \
+            repository. Once registered, you can create worktrees, manage env vars, \
+            and use `grove start` with this project.",
+        after_help = "Examples:\n  \
+            grove add myapp /home/user/code/myapp\n  \
+            grove add api ~/projects/api-server"
+    )]
     Add {
-        /// Project name
+        /// Short name to identify this project in grove commands
         name: String,
-        /// Path to the git repository
+        /// Path to the git or jj repository root (must contain .git or .jj)
         path: PathBuf,
     },
     /// Show all registered projects
+    #[command(
+        long_about = "Show all projects registered with grove.\n\n\
+            Outputs each project's name and path, tab-separated. \
+            Projects are registered with `grove add` and stored in \
+            the grove config file (~/.config/grove/config.toml).",
+        after_help = "Examples:\n  grove list"
+    )]
     List,
     /// Unregister a project (doesn't delete files)
+    #[command(
+        long_about = "Unregister a project from grove.\n\n\
+            This removes the project from grove's config but does NOT delete \
+            the repository, worktrees, or any files on disk. To also clean up \
+            worktrees, remove them first with `grove worktree rm`.",
+        after_help = "Examples:\n  grove remove myapp"
+    )]
     Remove {
-        /// Project name
+        /// Name of the project to unregister
         name: String,
     },
     /// Manage environment variables
+    #[command(
+        long_about = "Manage per-project and per-worktree environment variables.\n\n\
+            Environment variables are stored in ~/.config/grove/envs/ and can be \
+            injected into your shell via the mise integration (`grove init-mise`). \
+            Variables set at the project level apply to all worktrees. Variables \
+            set at the worktree level override project-level values. Repo-level \
+            defaults can also be defined in .grove/config.toml under [env].\n\n\
+            When a project argument is omitted, grove auto-detects the project \
+            from your current working directory.",
+        after_help = "Examples:\n  \
+            grove env set myapp DATABASE_URL=postgres://localhost/myapp\n  \
+            grove env list myapp\n  \
+            grove env unset myapp DATABASE_URL"
+    )]
     Env {
         #[command(subcommand)]
         command: EnvCommands,
     },
     /// Manage git/jj worktrees
+    #[command(
+        long_about = "Manage git worktrees and jj workspaces for registered projects.\n\n\
+            Grove creates worktrees in a configurable base directory (defaults to \
+            <repo>/.worktrees/). Each worktree gets its own branch (git) or workspace \
+            (jj). If the project has database configuration, a dedicated database is \
+            created per worktree and the DATABASE_URL is set automatically.\n\n\
+            The VCS backend is auto-detected: if the repo has a .jj directory, jj is \
+            used; otherwise git. Use --vcs git to force git mode for colocated repos.",
+        after_help = "Examples:\n  \
+            grove worktree new myapp my-feature\n  \
+            grove worktree list myapp\n  \
+            grove worktree rm myapp-my-feature"
+    )]
     Worktree {
         /// Force a specific VCS backend (e.g., "git") instead of auto-detection
         #[arg(long)]
@@ -54,46 +117,117 @@ enum Commands {
         command: WorktreeCommands,
     },
     /// Create a worktree, run hooks, and open editor
+    #[command(
+        long_about = "Create a new worktree (or reuse an existing one), run lifecycle hooks, \
+            and open it in your $EDITOR.\n\n\
+            This is the high-level \"start working\" command. It combines worktree \
+            creation, database provisioning, mise trust, post-create hooks, and editor \
+            launch into a single step. If the worktree already exists, it skips creation \
+            and just opens the editor.\n\n\
+            Requires $EDITOR to be set for the editor launch (silently skipped if unset).",
+        after_help = "Examples:\n  \
+            grove start myapp my-feature\n  \
+            grove start myapp bugfix-123 --vcs git"
+    )]
     Start {
-        /// Project name
+        /// Name of the registered project
         project: String,
-        /// Worktree name
+        /// Name for the new worktree (alphanumeric, hyphens, underscores only)
         name: String,
         /// Force a specific VCS backend (e.g., "git") instead of auto-detection
         #[arg(long)]
         vcs: Option<String>,
     },
     /// Install grove plugin for mise
+    #[command(
+        long_about = "Install the grove plugin for mise so that grove-managed environment \
+            variables are automatically injected into your shell.\n\n\
+            This copies the plugin files to mise's plugin directory \
+            (~/.local/share/mise/plugins/grove/) and prints the config snippet \
+            you need to add to ~/.config/mise/config.toml.\n\n\
+            After running this command and adding the config, mise will automatically \
+            export grove environment variables when you cd into a project directory.",
+        after_help = "Examples:\n  grove init-mise\n\n\
+            After running, add to ~/.config/mise/config.toml:\n  \
+            [env]\n  _.grove = {}"
+    )]
     InitMise,
 }
 
 #[derive(clap::Subcommand)]
 enum EnvCommands {
     /// Set an environment variable
+    #[command(
+        long_about = "Set an environment variable for a project or worktree.\n\n\
+            The project can be specified explicitly or auto-detected from your \
+            current directory. Use the project/worktree syntax to set a variable \
+            on a specific worktree (overrides the project-level value).",
+        after_help = "Examples:\n  \
+            # Set for a project (explicit name):\n  \
+            grove env set myapp DATABASE_URL=postgres://localhost/myapp\n\n  \
+            # Set for current project (auto-detected from cwd):\n  \
+            grove env set SECRET_KEY=abc123\n\n  \
+            # Set for a specific worktree:\n  \
+            grove env set myapp/my-feature DATABASE_URL=postgres://localhost/myapp_feature"
+    )]
     Set {
-        /// Project name or KEY=value pair (auto-detects project from cwd if this is a KEY=value)
+        /// Project name or KEY=value pair (auto-detects project from cwd if KEY=value)
         project_or_pair: String,
-        /// KEY=value pair (when provided, first argument is treated as project name)
+        /// KEY=value pair (when first argument is a project name)
         pair: Option<String>,
     },
     /// Show all environment variables
+    #[command(
+        long_about = "List all environment variables for a project or worktree.\n\n\
+            Shows variables from all sources (repo .grove/config.toml, project-level, \
+            and worktree-level) with labels indicating where each value comes from. \
+            Worktree-level values override project-level values, which override repo-level.\n\n\
+            If no project is specified, auto-detects from the current directory.",
+        after_help = "Examples:\n  \
+            grove env list myapp\n  \
+            grove env list myapp/my-feature\n  \
+            grove env list          # auto-detect from cwd"
+    )]
     List {
         /// Project name or project/worktree (auto-detects from cwd if omitted)
         project: Option<String>,
     },
     /// Remove an environment variable
+    #[command(
+        long_about = "Remove an environment variable from a project or worktree.\n\n\
+            The project can be specified explicitly or auto-detected from the \
+            current directory. Use project/worktree syntax to remove a worktree-level \
+            override (the project-level value will then apply again).",
+        after_help = "Examples:\n  \
+            grove env unset myapp SECRET_KEY\n  \
+            grove env unset SECRET_KEY           # auto-detect project from cwd\n  \
+            grove env unset myapp/feat DATABASE_URL"
+    )]
     Unset {
         /// Project name or env var key (auto-detects project from cwd if only one arg)
         project_or_key: String,
-        /// Env var key (when provided, first argument is treated as project name)
+        /// Env var key (when first argument is a project name)
         key: Option<String>,
     },
     /// Output environment variables for the project containing a path
+    #[command(
+        long_about = "Export resolved environment variables for a given directory path.\n\n\
+            Looks up which project (and optionally worktree) owns the given path, \
+            merges all env var layers (repo, project, worktree), and outputs them. \
+            By default outputs in KEY=value format (one per line); with --json \
+            outputs a JSON object.\n\n\
+            This is primarily used by the mise plugin to inject variables into the \
+            shell, but can also be used for scripting.",
+        after_help = "Examples:\n  \
+            grove env export /home/user/code/myapp\n  \
+            grove env export --json /home/user/code/myapp/.worktrees/feat\n  \
+            eval \"$(grove env export /home/user/code/myapp)\""
+    )]
     Export {
-        /// Output as JSON object
+        /// Output as a JSON object instead of KEY=value lines
         #[arg(long)]
         json: bool,
-        /// Directory path
+        /// Directory path to resolve the project and worktree from
         path: PathBuf,
     },
 }
@@ -101,20 +235,57 @@ enum EnvCommands {
 #[derive(clap::Subcommand)]
 enum WorktreeCommands {
     /// Create a new worktree
+    #[command(
+        long_about = "Create a new git worktree or jj workspace for a project.\n\n\
+            The worktree is created in the project's worktree base directory \
+            (defaults to <repo>/.worktrees/<name>). For git repos, a new branch \
+            with the worktree name is created. For jj repos, a new workspace is added.\n\n\
+            If the project has database configuration in .grove/config.toml, a \
+            dedicated database is created and DATABASE_URL is set automatically. \
+            Post-create hooks (if configured) run after creation.\n\n\
+            The project can be specified explicitly or auto-detected from cwd.",
+        after_help = "Examples:\n  \
+            # Explicit project:\n  \
+            grove worktree new myapp my-feature\n\n  \
+            # Auto-detect project from cwd:\n  \
+            grove worktree new my-feature"
+    )]
     New {
         /// Worktree name, or project name if second argument is provided
         name_or_project: String,
-        /// Worktree name (when provided, first argument is treated as project name)
+        /// Worktree name (when provided, first argument is the project name)
         name: Option<String>,
     },
     /// List worktrees
+    #[command(
+        long_about = "List all worktrees across registered projects.\n\n\
+            Shows each worktree's full name (project-worktree), branch, and path, \
+            tab-separated. If a project is specified, only shows worktrees for \
+            that project. Also includes worktrees from auto-detected projects \
+            (via .grove/config.toml in cwd).",
+        after_help = "Examples:\n  \
+            grove worktree list\n  \
+            grove worktree list myapp"
+    )]
     List {
-        /// Optional: filter to specific project
+        /// Only show worktrees for this project
         project: Option<String>,
     },
     /// Remove a worktree
+    #[command(
+        long_about = "Remove a git worktree or jj workspace.\n\n\
+            Accepts either the full name (e.g., \"myapp-my-feature\") or just the \
+            short worktree name (e.g., \"my-feature\") if it's unambiguous across \
+            all projects. If the project has database configuration, the worktree's \
+            database is dropped automatically.\n\n\
+            For git, this runs `git worktree remove`. For jj, this runs \
+            `jj workspace forget` and deletes the directory.",
+        after_help = "Examples:\n  \
+            grove worktree rm myapp-my-feature\n  \
+            grove worktree rm my-feature          # if unambiguous"
+    )]
     Rm {
-        /// Worktree name (full name like "project-feature" or just "feature" if unambiguous)
+        /// Worktree name (full \"project-name\" or short \"name\" if unambiguous)
         name: String,
     },
 }
