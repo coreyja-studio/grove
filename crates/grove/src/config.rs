@@ -1,3 +1,18 @@
+//! Configuration management for grove.
+//!
+//! Grove uses a layered configuration system:
+//!
+//! 1. **Global config** (`~/.config/grove/config.toml`) — The project registry.
+//!    Maps project names to repository paths, with optional database and hooks config.
+//!
+//! 2. **Repo config** (`.grove/config.toml` in the repository root) — Per-repo
+//!    defaults for database URLs, hooks, and environment variables. Committed to
+//!    the repo so all contributors share the same base config.
+//!
+//! 3. **Environment variables** (`~/.config/grove/envs/`) — Per-project and
+//!    per-worktree env var overrides stored outside the repo. Worktree values
+//!    override project values, which override repo defaults.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};

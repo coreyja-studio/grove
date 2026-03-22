@@ -1,3 +1,10 @@
+//! VCS backend abstraction for worktree and workspace management.
+//!
+//! Grove supports both git worktrees and jj workspaces through the [`VcsBackend`]
+//! trait. The backend is auto-detected: if the repository contains a `.jj/`
+//! directory, jj is used; otherwise git. Users can force git mode with `--vcs git`
+//! for colocated repos.
+
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};

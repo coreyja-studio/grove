@@ -105,3 +105,17 @@ jobs:
           ARCHIVE=grove-${{ needs.release-please.outputs.tag_name }}-${{ matrix.target }}.tar.gz
           tar czf "$ARCHIVE" -C "$(dirname "$BINARY")" "$(basename "$BINARY")"
           gh release upload "${{ needs.release-please.outputs.tag_name }}" "$ARCHIVE"
+
+  deploy-docs:
+    needs: [ready]
+    if: always() && needs.ready.result == 'success' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-action/setup-flyctl@master
+
+      - name: Deploy to Fly.io
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
