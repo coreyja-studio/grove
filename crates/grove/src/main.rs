@@ -1,3 +1,42 @@
+//! # Grove
+//!
+//! A lightweight CLI for managing multiple git/jj repositories with per-project
+//! environment variables and centralized worktree management.
+//!
+//! ## Core Concepts
+//!
+//! - **Project Registry** — Track multiple repositories under short names.
+//!   Register with `grove add`, list with `grove list`.
+//! - **Environment Variables** — Layered env vars stored outside the repo.
+//!   Project-level defaults, worktree-level overrides, and repo-level
+//!   defaults in `.grove/config.toml`. Integrates with [mise](https://mise.jdx.dev/)
+//!   for automatic shell injection.
+//! - **Worktree Management** — Create and manage git worktrees (or jj workspaces)
+//!   across all projects from a single command. Worktrees get their own
+//!   database instances and env var overrides.
+//!
+//! ## Quick Start
+//!
+//! ```bash
+//! # Register a project
+//! grove add myapp /path/to/repo
+//!
+//! # Set environment variables
+//! grove env set myapp DATABASE_URL=postgres:///myapp_dev
+//!
+//! # Create a worktree and start working
+//! grove start myapp my-feature
+//!
+//! # List all worktrees across projects
+//! grove worktree list
+//! ```
+//!
+//! ## Modules
+//!
+//! - [`config`] — Configuration loading, project registry, env var management
+//! - [`vcs`] — VCS backend abstraction (git, jj)
+//! - [`error`] — Error types
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 

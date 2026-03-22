@@ -1,3 +1,9 @@
+//! Error types for grove operations.
+//!
+//! All fallible operations in grove return [`Result<T>`], which uses the
+//! [`Error`] enum. Errors cover configuration issues, VCS operations,
+//! environment variable parsing, and hook execution.
+
 use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, Error>;

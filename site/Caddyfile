@@ -1,0 +1,16 @@
+:8080 {
+    handle /docs {
+        redir /docs/grove/ 308
+    }
+    handle /docs/ {
+        redir /docs/grove/ 308
+    }
+    handle_path /docs/* {
+        root * /srv/docs
+        file_server
+    }
+    handle {
+        root * /srv/site
+        file_server
+    }
+}
