@@ -4,56 +4,100 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Grove - Multi-repo management CLI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
       background: #121131;
-      color: #e0e0e0;
-      font-family: system-ui, -apple-system, sans-serif;
-      line-height: 1.6;
-      padding: 2rem 1rem;
+      color: #d8d8e8;
+      font-family: 'Quicksand', system-ui, -apple-system, sans-serif;
+      line-height: 1.7;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
     }
-    .container { max-width: 700px; margin: 0 auto; }
-    header { margin-bottom: 3rem; }
-    h1 { color: #F0F0FF; font-size: 2.5rem; margin-bottom: 0.5rem; }
-    .tagline { font-size: 1.2rem; color: #c0c0d0; }
-    h2 { color: #F0F0FF; font-size: 1.4rem; margin: 2rem 0 1rem; }
-    a { color: #A1A8FF; }
-    a:hover { text-decoration: none; }
+    .container {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 4rem 1.5rem 2rem;
+      flex: 1;
+    }
+    header { margin-bottom: 3.5rem; text-align: center; }
+    h1 {
+      color: #F0F0FF;
+      font-size: 3rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      margin-bottom: 0.75rem;
+    }
+    .tagline {
+      font-size: 1.15rem;
+      color: #a0a0b8;
+      max-width: 540px;
+      margin: 0 auto;
+    }
+    h2 {
+      color: #F0F0FF;
+      font-size: 1.3rem;
+      font-weight: 600;
+      margin: 2.5rem 0 1rem;
+      letter-spacing: 0.01em;
+    }
+    a { color: #A1A8FF; transition: color 0.15s; }
+    a:hover { color: #c4c9ff; text-decoration: none; }
     ul { list-style: none; padding: 0; }
-    ul li { padding: 0.4rem 0; padding-left: 1.2rem; position: relative; }
-    ul li::before { content: "-"; position: absolute; left: 0; color: #A1A8FF; }
+    ul li {
+      padding: 0.6rem 0 0.6rem 1.4rem;
+      position: relative;
+      border-left: 2px solid rgba(161, 168, 255, 0.15);
+      margin-left: 0.25rem;
+    }
+    ul li + li { margin-top: 0.25rem; }
+    ul li strong { color: #F0F0FF; font-weight: 600; }
     code {
       background: rgba(161, 168, 255, 0.1);
-      padding: 0.15rem 0.4rem;
-      border-radius: 3px;
-      font-size: 0.95em;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      font-size: 0.9em;
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
     }
     pre {
-      background: rgba(161, 168, 255, 0.08);
-      padding: 1rem;
-      border-radius: 6px;
+      background: rgba(161, 168, 255, 0.06);
+      border: 1px solid rgba(161, 168, 255, 0.1);
+      padding: 1rem 1.25rem;
+      border-radius: 8px;
       overflow-x: auto;
-      margin: 0.5rem 0;
+      margin: 0.75rem 0;
     }
     pre code { background: none; padding: 0; }
-    .install { margin: 2rem 0; }
-    .docs-link { margin: 2rem 0; }
+    .install { margin: 2.5rem 0; }
+    .docs-link { margin: 2.5rem 0; }
     .docs-link a {
       display: inline-block;
-      padding: 0.6rem 1.2rem;
+      padding: 0.65rem 1.4rem;
       border: 1px solid #A1A8FF;
-      border-radius: 6px;
+      border-radius: 8px;
       text-decoration: none;
+      font-weight: 500;
+      transition: background 0.15s, box-shadow 0.15s;
     }
-    .docs-link a:hover { background: rgba(161, 168, 255, 0.1); }
+    .docs-link a:hover {
+      background: rgba(161, 168, 255, 0.1);
+      box-shadow: 0 0 16px rgba(161, 168, 255, 0.15);
+    }
     footer {
-      margin-top: 4rem;
-      padding-top: 1.5rem;
-      border-top: 1px solid rgba(240, 240, 255, 0.1);
-      font-size: 0.9rem;
-      color: #808090;
+      padding: 1.5rem;
+      border-top: 1px solid rgba(240, 240, 255, 0.08);
+      font-size: 0.85rem;
+      color: #606078;
+      display: flex;
+      justify-content: center;
+      gap: 1.5rem;
     }
+    footer a { color: #808098; }
+    footer a:hover { color: #A1A8FF; }
   </style>
 </head>
 <body>
@@ -84,10 +128,11 @@
         <a href="/docs">View full documentation</a>
       </div>
     </main>
-
-    <footer>
-      <a href="https://github.com/coreyja-studio/grove">GitHub</a>
-    </footer>
   </div>
+
+  <footer>
+    <span>Made by <a href="https://coreyja.com">coreyja</a></span>
+    <a href="https://github.com/coreyja-studio/grove">GitHub</a>
+  </footer>
 </body>
 </html>
