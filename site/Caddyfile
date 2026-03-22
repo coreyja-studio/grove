@@ -1,7 +1,7 @@
 :8080 {
-    handle /docs {
-        redir /docs/grove/ 308
-    }
+    @docs-exact path /docs
+    redir @docs-exact /docs/grove/ 308
+
     handle_path /docs/* {
         @root path /
         redir @root /docs/grove/ 308
