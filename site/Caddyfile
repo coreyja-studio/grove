@@ -2,10 +2,9 @@
     handle /docs {
         redir /docs/grove/ 308
     }
-    handle /docs/ {
-        redir /docs/grove/ 308
-    }
     handle_path /docs/* {
+        @root path /
+        redir @root /docs/grove/ 308
         root * /srv/docs
         file_server
     }
