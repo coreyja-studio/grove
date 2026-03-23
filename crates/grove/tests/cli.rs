@@ -2687,6 +2687,112 @@ FROM_REPO = "yes"
             .stdout(predicate::str::contains("FROM_REPO"))
             .stdout(predicate::str::contains("yes"));
     }
+
+    #[test]
+    fn test_auto_detect_registers_to_registry() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
+        grove_cmd(&config_dir)
+            .args(["env", "list"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(
+                "Registered \"myproject\" to project registry",
+            ));
+
+        grove_cmd(&config_dir)
+            .arg("list")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("myproject"));
+    }
+
+    #[test]
+    fn test_auto_detect_no_duplicate_registration() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
+        grove_cmd(&config_dir)
+            .args(["env", "list"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("Registered \"myproject\""));
+
+        grove_cmd(&config_dir)
+            .args(["env", "list"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("Registered").not());
+    }
+
+    #[test]
+    fn test_auto_detect_registers_with_directory_name() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "cool-project");
+
+        write_grove_config(&repo, "");
+
+        grove_cmd(&config_dir)
+            .args(["env", "list"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("Registered \"cool-project\""));
+
+        grove_cmd(&config_dir)
+            .arg("list")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("cool-project"));
+    }
+
+    #[test]
+    fn test_auto_register_message_on_stderr() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
+        grove_cmd(&config_dir)
+            .args(["env", "export", "--json", repo.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::starts_with("{"))
+            .stderr(predicate::str::contains("Registered \"myproject\""));
+    }
+
+    #[test]
+    fn test_already_registered_skips_auto_register() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
+        grove_cmd(&config_dir)
+            .args(["add", "myproject", repo.to_str().unwrap()])
+            .assert()
+            .success();
+
+        grove_cmd(&config_dir)
+            .args(["env", "list"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("Registered").not());
+    }
 }
 
 mod jj_workspace {
