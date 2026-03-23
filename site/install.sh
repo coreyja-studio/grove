@@ -60,7 +60,7 @@ main() {
 
   info "Installing grove ${version} for ${platform}..."
 
-  archive="grove-${platform}.tar.gz"
+  archive="grove-${version}-${platform}.tar.gz"
   download_url="https://github.com/${REPO}/releases/download/${version}/${archive}"
 
   tmpdir="$(mktemp -d)"
