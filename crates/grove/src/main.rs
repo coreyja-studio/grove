@@ -882,7 +882,7 @@ fn cmd_worktree_list(
     project_filter: Option<&str>,
     vcs_override: Option<vcs::VcsOverride>,
 ) -> Result<()> {
-    let config = Config::load()?;
+    let mut config = Config::load()?;
 
     let mut found_any = false;
     // Track seen repo paths (not names) to deduplicate when registered name ≠ effective_name()
@@ -932,6 +932,12 @@ fn cmd_worktree_list(
             let user_proj = config.projects.get(&name);
             let path = user_proj.map_or_else(|| repo_root.clone(), |p| p.path.clone());
             let project = config::merge_project(Some(repo_config), user_proj, path);
+
+            // Auto-register if not already in registry
+            if !config.projects.contains_key(&name) {
+                config.register_discovered(&name, project.clone());
+            }
+
             let backend = vcs::detect_backend(&project.path, vcs_override)?;
             let worktrees = backend.list_worktrees(&project.path, &project.worktree_base())?;
             for wt in worktrees {
