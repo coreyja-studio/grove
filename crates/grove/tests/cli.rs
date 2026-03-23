@@ -2793,6 +2793,32 @@ FROM_REPO = "yes"
             .success()
             .stderr(predicate::str::contains("Registered").not());
     }
+
+    #[test]
+    fn test_worktree_list_auto_registers() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
+        // worktree list should also trigger auto-registration
+        grove_cmd(&config_dir)
+            .args(["worktree", "list"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(
+                "Registered \"myproject\" to project registry",
+            ));
+
+        // Project should now appear in grove list
+        grove_cmd(&config_dir)
+            .arg("list")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("myproject"));
+    }
 }
 
 mod jj_workspace {
