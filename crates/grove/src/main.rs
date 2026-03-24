@@ -1152,10 +1152,7 @@ fn cmd_update(check_only: bool) -> Result<()> {
         .get_latest_release()
         .map_err(|e| Error::Update(e.to_string()))?;
 
-    let latest_version = latest
-        .version
-        .strip_prefix('v')
-        .unwrap_or(&latest.version);
+    let latest_version = latest.version.strip_prefix('v').unwrap_or(&latest.version);
 
     if check_only {
         println!("Current version: {current}");
@@ -1173,9 +1170,7 @@ fn cmd_update(check_only: bool) -> Result<()> {
 
     println!("Updating grove v{current} -> v{latest_version}...");
 
-    let status = updater
-        .update()
-        .map_err(|e| Error::Update(e.to_string()))?;
+    let status = updater.update().map_err(|e| Error::Update(e.to_string()))?;
 
     let new_version = status
         .version()
