@@ -40,7 +40,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 mod config;
 mod error;
@@ -204,6 +204,21 @@ enum Commands {
         /// Only check for updates without installing
         #[arg(long)]
         check: bool,
+    },
+    /// Generate shell completion scripts
+    #[command(
+        long_about = "Generate shell completion scripts for grove.\n\n\
+            Output the completion script to stdout. Pipe it to the appropriate \
+            location for your shell to enable tab-completion of grove commands \
+            and arguments.",
+        after_help = "Examples:\n  \
+            grove completions bash > ~/.local/share/bash-completion/completions/grove\n  \
+            grove completions zsh > ~/.zfunc/_grove\n  \
+            grove completions fish > ~/.config/fish/completions/grove.fish"
+    )]
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
     },
 }
 
@@ -371,6 +386,10 @@ fn run(command: Commands) -> Result<()> {
         },
         Commands::InitMise => cmd_init_mise(),
         Commands::Update { check } => cmd_update(check),
+        Commands::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "grove", &mut std::io::stdout());
+            Ok(())
+        }
         Commands::Start { project, name, vcs } => {
             let vcs_override = parse_vcs_override(vcs.as_deref())?;
             cmd_start(&project, &name, vcs_override)
