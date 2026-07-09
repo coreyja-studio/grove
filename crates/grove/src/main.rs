@@ -191,6 +191,20 @@ enum Commands {
             [env]\n  _.grove = {}"
     )]
     InitMise,
+    /// Update grove to the latest release
+    #[command(
+        long_about = "Update grove to the latest GitHub release.\n\n\
+            Checks the latest release of coreyja-studio/grove on GitHub and, \
+            if a newer version is available, downloads the correct binary for \
+            your platform and replaces the current executable. Use --check to \
+            see the latest version without downloading.",
+        after_help = "Examples:\n  grove update\n  grove update --check"
+    )]
+    Update {
+        /// Only check for updates without installing
+        #[arg(long)]
+        check: bool,
+    },
     /// Generate shell completion scripts
     #[command(
         long_about = "Generate shell completion scripts for grove.\n\n\
@@ -371,6 +385,7 @@ fn run(command: Commands) -> Result<()> {
             EnvCommands::Export { json, path } => cmd_env_export(path, json),
         },
         Commands::InitMise => cmd_init_mise(),
+        Commands::Update { check } => cmd_update(check),
         Commands::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "grove", &mut std::io::stdout());
             Ok(())
@@ -1137,6 +1152,50 @@ fn cmd_init_mise() -> Result<()> {
     println!("_.grove = {{}}");
     println!();
     println!("If the file doesn't exist yet, create it first.");
+
+    Ok(())
+}
+
+fn cmd_update(check_only: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+
+    let updater = self_update::backends::github::Update::configure()
+        .repo_owner("coreyja-studio")
+        .repo_name("grove")
+        .bin_name("grove")
+        .current_version(current)
+        .build()
+        .map_err(|e| Error::Update(e.to_string()))?;
+
+    let latest = updater
+        .get_latest_release()
+        .map_err(|e| Error::Update(e.to_string()))?;
+
+    let latest_version = latest.version.strip_prefix('v').unwrap_or(&latest.version);
+
+    if check_only {
+        println!("Current version: {current}");
+        println!("Latest version:  {latest_version}");
+        if latest_version == current {
+            println!("Already up to date.");
+        }
+        return Ok(());
+    }
+
+    if latest_version == current {
+        println!("Already up to date (v{current}).");
+        return Ok(());
+    }
+
+    println!("Updating grove v{current} -> v{latest_version}...");
+
+    let status = updater.update().map_err(|e| Error::Update(e.to_string()))?;
+
+    let new_version = status
+        .version()
+        .strip_prefix('v')
+        .unwrap_or(status.version());
+    println!("Updated to v{new_version}.");
 
     Ok(())
 }

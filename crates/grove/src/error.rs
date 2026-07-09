@@ -90,4 +90,7 @@ pub enum Error {
 
     #[error("Editor '{0}' exited with status {1}")]
     EditorFailed(String, String),
+
+    #[error("Update failed: {0}")]
+    Update(String),
 }
