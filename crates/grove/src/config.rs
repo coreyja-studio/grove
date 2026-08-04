@@ -318,6 +318,31 @@ impl Config {
         Ok(())
     }
 
+    /// Register a discovered project to the registry, printing a message to stderr.
+    /// Returns `true` if the project was newly registered, `false` if it was already present.
+    /// On save failure, prints a warning to stderr and returns `false`.
+    ///
+    /// Unlike [`add_project`], this skips VCS validation and path canonicalization
+    /// because `discover()` has already verified and canonicalized the path.
+    pub fn register_discovered(&mut self, name: &str, project: Project) -> bool {
+        if self.projects.contains_key(name) {
+            return false;
+        }
+        self.projects.insert(name.to_string(), project);
+        match self.save() {
+            Ok(()) => {
+                eprintln!("Registered \"{name}\" to project registry");
+                true
+            }
+            Err(e) => {
+                // Remove the entry we just inserted since save failed
+                self.projects.remove(name);
+                eprintln!("Warning: could not register \"{name}\" to project registry: {e}");
+                false
+            }
+        }
+    }
+
     pub fn remove_project(&mut self, name: &str) -> Result<()> {
         if self.projects.remove(name).is_none() {
             return Err(Error::ProjectNotFound(name.to_string()));
@@ -462,7 +487,7 @@ pub fn load_merged_env(
 /// Resolve a project by explicit name or auto-detection from cwd.
 /// Returns `(name, project, repo_env_vars)`.
 pub fn resolve_project(
-    config: &Config,
+    config: &mut Config,
     explicit_name: Option<&str>,
 ) -> Result<(String, Project, BTreeMap<String, String>)> {
     if let Some(name) = explicit_name {
@@ -486,6 +511,11 @@ pub fn resolve_project(
                 let path = user_proj.map_or(repo_root, |p| p.path.clone());
                 let merged = merge_project(Some(&repo_config), user_proj, path);
                 let repo_env = repo_config.env.unwrap_or_default();
+
+                if !config.projects.contains_key(name) {
+                    config.register_discovered(name, merged.clone());
+                }
+
                 return Ok((name.to_string(), merged, repo_env));
             }
         }
@@ -513,6 +543,11 @@ pub fn resolve_project(
         let path = user_proj.map(|p| p.path.clone()).unwrap_or(repo_root);
         let merged = merge_project(Some(&repo_config), user_proj, path);
         let repo_env = repo_config.env.unwrap_or_default();
+
+        if !config.projects.contains_key(&name) {
+            config.register_discovered(&name, merged.clone());
+        }
+
         return Ok((name, merged, repo_env));
     }
 
@@ -525,7 +560,7 @@ pub type ResolvedProjectForPath = (String, Project, Option<String>, BTreeMap<Str
 /// Resolve a project for a filesystem path (used by env export).
 /// Returns `(name, project, worktree_name, repo_env_vars)`.
 pub fn resolve_project_for_path(
-    config: &Config,
+    config: &mut Config,
     path: &Path,
 ) -> Result<Option<ResolvedProjectForPath>> {
     if let Some(project_ref) = config.find_project_for_path(path)? {
@@ -569,6 +604,11 @@ pub fn resolve_project_for_path(
         };
 
         let repo_env = repo_config.env.unwrap_or_default();
+
+        if !config.projects.contains_key(&name) {
+            config.register_discovered(&name, merged.clone());
+        }
+
         return Ok(Some((name, merged, worktree, repo_env)));
     }
 
