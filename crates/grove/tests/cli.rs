@@ -1637,8 +1637,7 @@ mod database {
         Command::new("psql")
             .args(["-c", "SELECT 1"])
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Write a config file with a database section for a project.
@@ -2828,8 +2827,7 @@ mod jj_workspace {
         Command::new("jj")
             .arg("--version")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Creates a colocated jj repo with an initial commit.
