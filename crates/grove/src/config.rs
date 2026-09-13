@@ -14,9 +14,11 @@
 //!    override project values, which override repo defaults.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -271,6 +273,56 @@ pub(crate) fn worktree_env_path(project: &str, worktree: &str) -> Result<PathBuf
     Ok(envs_dir()?.join(project).join(format!("{worktree}.toml")))
 }
 
+fn config_lock_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("config.toml.lock"))
+}
+
+/// Acquire the exclusive advisory lock guarding the global config file.
+///
+/// Held for the whole read-modify-write cycle so two grove processes can't
+/// each load the registry, add a different project, and clobber one another.
+/// The lock is released when the returned handle is dropped.
+fn lock_config() -> Result<File> {
+    let path = config_lock_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create(&path)?;
+    // Fully qualified so this keeps resolving to fs4's trait method rather than
+    // std's inherent `File::lock`, which shares the name.
+    <File as FileExt>::lock(&file)?;
+    Ok(file)
+}
+
+/// Write `content` to `path` atomically: write a sibling temp file, fsync it,
+/// then rename it over the destination. A concurrent reader sees either the old
+/// file or the new one, never a truncated one.
+fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    let parent = path.parent().ok_or(Error::NoConfigDir)?;
+    fs::create_dir_all(parent)?;
+
+    let file_name = path.file_name().map_or_else(
+        || "config".to_string(),
+        |name| name.to_string_lossy().to_string(),
+    );
+    // Same directory as the target so the rename stays within one filesystem.
+    let tmp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+
+    let result = (|| -> Result<()> {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
@@ -282,14 +334,31 @@ impl Config {
         Ok(config)
     }
 
+    /// Write the registry to disk atomically.
+    ///
+    /// Callers that read-modify-write the registry should go through
+    /// [`Config::update`] instead, so the whole cycle is serialized against
+    /// other grove processes.
     pub fn save(&self) -> Result<()> {
         let path = config_path()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let content = toml::to_string_pretty(self)?;
-        fs::write(&path, content)?;
-        Ok(())
+        write_atomic(&path, &content)
+    }
+
+    /// Read-modify-write the registry while holding the exclusive config lock.
+    ///
+    /// `f` receives the config as it exists on disk *right now* — not a copy
+    /// loaded earlier — so concurrent grove processes queue up instead of
+    /// dropping each other's projects.
+    pub fn update<T, F>(f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        let _lock = lock_config()?;
+        let mut config = Self::load()?;
+        let value = f(&mut config)?;
+        config.save()?;
+        Ok(value)
     }
 
     pub fn add_project(&mut self, name: String, path: PathBuf) -> Result<()> {
@@ -316,6 +385,56 @@ impl Config {
             },
         );
         Ok(())
+    }
+
+    /// Register a discovered project to the registry, printing a message to stderr.
+    /// Returns `true` if the project was newly registered, `false` if it was already
+    /// present or could not be saved.
+    ///
+    /// Only ever called for write-intent commands (see [`AutoRegister`]) — read-only
+    /// commands must not mutate the registry, because `grove env export` runs on
+    /// every directory change under the mise integration.
+    ///
+    /// The registry is re-read under the config lock before the insert, so a project
+    /// registered concurrently by another grove process is never dropped. On failure
+    /// this prints a warning and leaves both disk and memory untouched; registration
+    /// is a convenience and must never block the command that triggered it.
+    ///
+    /// Unlike [`add_project`], this skips VCS validation and path canonicalization
+    /// because `discover()` has already verified and canonicalized the path.
+    pub fn register_discovered(&mut self, name: &str, project: Project) -> bool {
+        if self.projects.contains_key(name) {
+            return false;
+        }
+
+        match Self::insert_discovered(name, project) {
+            Ok((fresh, registered)) => {
+                // Adopt the on-disk state so in-memory config matches what was
+                // written, including entries other processes added meanwhile.
+                *self = fresh;
+                if registered {
+                    eprintln!("Registered \"{name}\" to project registry");
+                }
+                registered
+            }
+            Err(e) => {
+                eprintln!("Warning: could not register \"{name}\" to project registry: {e}");
+                false
+            }
+        }
+    }
+
+    /// Insert `project` into the on-disk registry under the config lock.
+    /// Returns the resulting config and whether this call added the entry.
+    fn insert_discovered(name: &str, project: Project) -> Result<(Self, bool)> {
+        let _lock = lock_config()?;
+        let mut config = Self::load()?;
+        if config.projects.contains_key(name) {
+            return Ok((config, false));
+        }
+        config.projects.insert(name.to_string(), project);
+        config.save()?;
+        Ok((config, true))
     }
 
     pub fn remove_project(&mut self, name: &str) -> Result<()> {
@@ -377,12 +496,8 @@ impl EnvVars {
 
     pub fn save(&self, project: &str) -> Result<()> {
         let path = env_path(project)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let content = toml::to_string_pretty(self)?;
-        fs::write(&path, content)?;
-        Ok(())
+        write_atomic(&path, &content)
     }
 
     pub fn load_worktree(project: &str, worktree: &str) -> Result<Self> {
@@ -397,12 +512,8 @@ impl EnvVars {
 
     pub fn save_worktree(&self, project: &str, worktree: &str) -> Result<()> {
         let path = worktree_env_path(project, worktree)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let content = toml::to_string_pretty(self)?;
-        fs::write(&path, content)?;
-        Ok(())
+        write_atomic(&path, &content)
     }
 
     pub fn set(&mut self, key: String, value: String) {
@@ -459,11 +570,34 @@ pub fn load_merged_env(
         .collect())
 }
 
+/// Whether a resolver may persist a newly auto-detected project to the registry.
+///
+/// Auto-registration is a side effect on the user's global config, so it is opt-in
+/// per command rather than a property of resolution itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoRegister {
+    /// Write-intent command (`grove start`, `grove worktree new`, `grove env set`,
+    /// `grove env unset`): persist a newly discovered project.
+    Enabled,
+    /// Read-only command (`grove env list`, `grove env export`, `grove worktree list`):
+    /// resolve without touching the registry. `grove env export` in particular runs on
+    /// every directory change under the mise integration, so plain `cd` must never
+    /// mutate persistent state.
+    Disabled,
+}
+
+impl AutoRegister {
+    fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
 /// Resolve a project by explicit name or auto-detection from cwd.
 /// Returns `(name, project, repo_env_vars)`.
 pub fn resolve_project(
-    config: &Config,
+    config: &mut Config,
     explicit_name: Option<&str>,
+    auto_register: AutoRegister,
 ) -> Result<(String, Project, BTreeMap<String, String>)> {
     if let Some(name) = explicit_name {
         if let Some(user_proj) = config.projects.get(name) {
@@ -486,6 +620,11 @@ pub fn resolve_project(
                 let path = user_proj.map_or(repo_root, |p| p.path.clone());
                 let merged = merge_project(Some(&repo_config), user_proj, path);
                 let repo_env = repo_config.env.unwrap_or_default();
+
+                if auto_register.is_enabled() {
+                    config.register_discovered(name, merged.clone());
+                }
+
                 return Ok((name.to_string(), merged, repo_env));
             }
         }
@@ -513,6 +652,11 @@ pub fn resolve_project(
         let path = user_proj.map(|p| p.path.clone()).unwrap_or(repo_root);
         let merged = merge_project(Some(&repo_config), user_proj, path);
         let repo_env = repo_config.env.unwrap_or_default();
+
+        if auto_register.is_enabled() {
+            config.register_discovered(&name, merged.clone());
+        }
+
         return Ok((name, merged, repo_env));
     }
 
@@ -525,8 +669,9 @@ pub type ResolvedProjectForPath = (String, Project, Option<String>, BTreeMap<Str
 /// Resolve a project for a filesystem path (used by env export).
 /// Returns `(name, project, worktree_name, repo_env_vars)`.
 pub fn resolve_project_for_path(
-    config: &Config,
+    config: &mut Config,
     path: &Path,
+    auto_register: AutoRegister,
 ) -> Result<Option<ResolvedProjectForPath>> {
     if let Some(project_ref) = config.find_project_for_path(path)? {
         let user_proj = config.projects.get(&project_ref.project).unwrap();
@@ -569,6 +714,11 @@ pub fn resolve_project_for_path(
         };
 
         let repo_env = repo_config.env.unwrap_or_default();
+
+        if auto_register.is_enabled() {
+            config.register_discovered(&name, merged.clone());
+        }
+
         return Ok(Some((name, merged, worktree, repo_env)));
     }
 

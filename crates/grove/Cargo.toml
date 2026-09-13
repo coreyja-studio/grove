@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 dirs.workspace = true
+fs4.workspace = true
 thiserror.workspace = true
 self_update.workspace = true
 

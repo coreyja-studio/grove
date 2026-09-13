@@ -83,6 +83,13 @@ grove add backend ~/code/backend
 grove list
 ```
 
+Repos containing a `.grove/config.toml` are also registered automatically the
+first time you run a command that changes state inside them -- `grove start`,
+`grove worktree new`, `grove env set`, `grove env unset`. Read-only commands
+(`grove list`, `grove env list`, `grove env export`, `grove worktree list`)
+resolve the repo but never write to the registry, so the `mise` integration
+running `grove env export` on every directory change leaves your config alone.
+
 ### Layered Environment Variables
 
 Environment variables resolve in three layers, highest priority first:
