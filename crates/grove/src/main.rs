@@ -46,7 +46,7 @@ mod config;
 mod error;
 mod vcs;
 
-use config::{Config, EnvVars, ProjectRef};
+use config::{AutoRegister, Config, EnvVars, ProjectRef};
 use error::{Error, Result};
 
 const MISE_METADATA_LUA: &str = include_str!("mise_plugin/metadata.lua");
@@ -411,9 +411,7 @@ fn run(command: Commands) -> Result<()> {
 }
 
 fn cmd_add(name: &str, path: PathBuf) -> Result<()> {
-    let mut config = Config::load()?;
-    config.add_project(name.to_string(), path)?;
-    config.save()?;
+    Config::update(|config| config.add_project(name.to_string(), path))?;
     println!("Added project '{name}'");
     Ok(())
 }
@@ -431,9 +429,7 @@ fn cmd_list() -> Result<()> {
 }
 
 fn cmd_remove(name: &str) -> Result<()> {
-    let mut config = Config::load()?;
-    config.remove_project(name)?;
-    config.save()?;
+    Config::update(|config| config.remove_project(name))?;
     println!("Removed project '{name}'");
     Ok(())
 }
@@ -449,10 +445,12 @@ fn cmd_env_set(project_or_pair: &str, pair: Option<&str>) -> Result<()> {
     // For the two-arg form, project_ref may include a worktree specifier (project/worktree).
     let (project_ref, resolved) = if let Some(s) = project_str {
         let pr = ProjectRef::parse(s)?;
-        let resolved = config::resolve_project(&mut config, Some(&pr.project))?;
+        let resolved =
+            config::resolve_project(&mut config, Some(&pr.project), AutoRegister::Enabled)?;
         (pr, resolved)
     } else {
-        let (name, project, repo_env) = config::resolve_project(&mut config, None)?;
+        let (name, project, repo_env) =
+            config::resolve_project(&mut config, None, AutoRegister::Enabled)?;
         let pr = ProjectRef {
             project: name.clone(),
             worktree: None,
@@ -491,15 +489,18 @@ fn cmd_env_unset(project_or_key: &str, key: Option<&str>) -> Result<()> {
     let project_ref = if let Some(s) = project_str {
         ProjectRef::parse(s)?
     } else {
-        let (name, _, _) = config::resolve_project(&mut config, None)?;
+        let (name, _, _) = config::resolve_project(&mut config, None, AutoRegister::Enabled)?;
         ProjectRef {
             project: name,
             worktree: None,
         }
     };
 
-    let (_, resolved_project, _) =
-        config::resolve_project(&mut config, Some(&project_ref.project))?;
+    let (_, resolved_project, _) = config::resolve_project(
+        &mut config,
+        Some(&project_ref.project),
+        AutoRegister::Enabled,
+    )?;
 
     if let Some(wt_name) = &project_ref.worktree {
         validate_worktree_exists(&resolved_project, &project_ref.project, wt_name)?;
@@ -553,15 +554,18 @@ fn cmd_env_list(project: Option<&str>) -> Result<()> {
     let project_ref = if let Some(s) = project {
         ProjectRef::parse(s)?
     } else {
-        let (name, _, _) = config::resolve_project(&mut config, None)?;
+        let (name, _, _) = config::resolve_project(&mut config, None, AutoRegister::Disabled)?;
         ProjectRef {
             project: name,
             worktree: None,
         }
     };
 
-    let (_, resolved_project, repo_env) =
-        config::resolve_project(&mut config, Some(&project_ref.project))?;
+    let (_, resolved_project, repo_env) = config::resolve_project(
+        &mut config,
+        Some(&project_ref.project),
+        AutoRegister::Disabled,
+    )?;
 
     if let Some(wt_name) = &project_ref.worktree {
         validate_worktree_exists(&resolved_project, &project_ref.project, wt_name)?;
@@ -632,7 +636,7 @@ fn cmd_env_export(path: PathBuf, json: bool) -> Result<()> {
 
         let mut config = Config::load()?;
         let Some((name, _project, worktree, repo_env)) =
-            config::resolve_project_for_path(&mut config, &path)?
+            config::resolve_project_for_path(&mut config, &path, AutoRegister::Disabled)?
         else {
             println!("{{}}");
             return Ok(());
@@ -645,7 +649,7 @@ fn cmd_env_export(path: PathBuf, json: bool) -> Result<()> {
     } else {
         let mut config = Config::load()?;
         let (name, _project, worktree, repo_env) =
-            config::resolve_project_for_path(&mut config, &path)?
+            config::resolve_project_for_path(&mut config, &path, AutoRegister::Disabled)?
                 .ok_or(Error::NoProjectForPath(path))?;
 
         let merged = config::load_merged_env(&name, worktree.as_deref(), &repo_env)?;
@@ -872,7 +876,7 @@ fn cmd_start(project: &str, name: &str, vcs_override: Option<vcs::VcsOverride>) 
 
     let mut config = Config::load()?;
     let (project_name, resolved_project, _repo_env) =
-        config::resolve_project(&mut config, Some(project))?;
+        config::resolve_project(&mut config, Some(project), AutoRegister::Enabled)?;
 
     let worktree_path = resolved_project.worktree_base().join(name);
 
@@ -906,7 +910,7 @@ fn cmd_worktree_new(
 
     let mut config = Config::load()?;
     let (project_name, project, _repo_env) =
-        config::resolve_project(&mut config, explicit_project)?;
+        config::resolve_project(&mut config, explicit_project, AutoRegister::Enabled)?;
 
     create_worktree_with_hooks(&project_name, &project, worktree_name, vcs_override)?;
     Ok(())
@@ -916,7 +920,7 @@ fn cmd_worktree_list(
     project_filter: Option<&str>,
     vcs_override: Option<vcs::VcsOverride>,
 ) -> Result<()> {
-    let mut config = Config::load()?;
+    let config = Config::load()?;
 
     let mut found_any = false;
     // Track seen repo paths (not names) to deduplicate when registered name ≠ effective_name()
@@ -966,11 +970,6 @@ fn cmd_worktree_list(
             let user_proj = config.projects.get(&name);
             let path = user_proj.map_or_else(|| repo_root.clone(), |p| p.path.clone());
             let project = config::merge_project(Some(repo_config), user_proj, path);
-
-            // Auto-register if not already in registry
-            if !config.projects.contains_key(&name) {
-                config.register_discovered(&name, project.clone());
-            }
 
             let backend = vcs::detect_backend(&project.path, vcs_override)?;
             let worktrees = backend.list_worktrees(&project.path, &project.worktree_base())?;

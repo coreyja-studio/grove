@@ -2688,7 +2688,7 @@ FROM_REPO = "yes"
     }
 
     #[test]
-    fn test_auto_detect_registers_to_registry() {
+    fn test_write_intent_command_registers_to_registry() {
         let config_dir = TempDir::new().unwrap();
         let repos_dir = TempDir::new().unwrap();
         let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
@@ -2696,7 +2696,7 @@ FROM_REPO = "yes"
         write_grove_config(&repo, r#"name = "myproject""#);
 
         grove_cmd(&config_dir)
-            .args(["env", "list"])
+            .args(["env", "set", "FOO=bar"])
             .current_dir(&repo)
             .assert()
             .success()
@@ -2720,14 +2720,14 @@ FROM_REPO = "yes"
         write_grove_config(&repo, r#"name = "myproject""#);
 
         grove_cmd(&config_dir)
-            .args(["env", "list"])
+            .args(["env", "set", "FOO=bar"])
             .current_dir(&repo)
             .assert()
             .success()
             .stderr(predicate::str::contains("Registered \"myproject\""));
 
         grove_cmd(&config_dir)
-            .args(["env", "list"])
+            .args(["env", "set", "BAZ=qux"])
             .current_dir(&repo)
             .assert()
             .success()
@@ -2743,7 +2743,7 @@ FROM_REPO = "yes"
         write_grove_config(&repo, "");
 
         grove_cmd(&config_dir)
-            .args(["env", "list"])
+            .args(["env", "set", "FOO=bar"])
             .current_dir(&repo)
             .assert()
             .success()
@@ -2757,7 +2757,7 @@ FROM_REPO = "yes"
     }
 
     #[test]
-    fn test_auto_register_message_on_stderr() {
+    fn test_worktree_new_auto_registers() {
         let config_dir = TempDir::new().unwrap();
         let repos_dir = TempDir::new().unwrap();
         let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
@@ -2765,11 +2765,19 @@ FROM_REPO = "yes"
         write_grove_config(&repo, r#"name = "myproject""#);
 
         grove_cmd(&config_dir)
-            .args(["env", "export", "--json", repo.to_str().unwrap()])
+            .args(["worktree", "new", "feature"])
+            .current_dir(&repo)
             .assert()
             .success()
-            .stdout(predicate::str::starts_with("{"))
-            .stderr(predicate::str::contains("Registered \"myproject\""));
+            .stderr(predicate::str::contains(
+                "Registered \"myproject\" to project registry",
+            ));
+
+        grove_cmd(&config_dir)
+            .arg("list")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("myproject"));
     }
 
     #[test]
@@ -2786,37 +2794,125 @@ FROM_REPO = "yes"
             .success();
 
         grove_cmd(&config_dir)
-            .args(["env", "list"])
+            .args(["env", "set", "FOO=bar"])
             .current_dir(&repo)
             .assert()
             .success()
             .stderr(predicate::str::contains("Registered").not());
     }
 
+    /// Read-only commands must never write to the registry: `grove env export`
+    /// runs on every directory change under the mise integration, so a plain
+    /// `cd` into a repo must not mutate the user's global config.
     #[test]
-    fn test_worktree_list_auto_registers() {
+    fn test_env_export_does_not_register() {
         let config_dir = TempDir::new().unwrap();
         let repos_dir = TempDir::new().unwrap();
         let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
 
         write_grove_config(&repo, r#"name = "myproject""#);
 
-        // worktree list should also trigger auto-registration
+        grove_cmd(&config_dir)
+            .args(["env", "export", "--json", repo.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::starts_with("{"))
+            .stderr(predicate::str::contains("Registered").not());
+
+        assert!(
+            !config_dir.path().join("config.toml").exists(),
+            "env export must not create the project registry"
+        );
+
+        grove_cmd(&config_dir)
+            .arg("list")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No projects registered"));
+    }
+
+    #[test]
+    fn test_env_list_does_not_register() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
+        grove_cmd(&config_dir)
+            .args(["env", "list"])
+            .current_dir(&repo)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("Registered").not());
+
+        grove_cmd(&config_dir)
+            .arg("list")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No projects registered"));
+    }
+
+    #[test]
+    fn test_worktree_list_does_not_register() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+        let repo = create_real_git_repo_with_commit(&repos_dir, "myproject");
+
+        write_grove_config(&repo, r#"name = "myproject""#);
+
         grove_cmd(&config_dir)
             .args(["worktree", "list"])
             .current_dir(&repo)
             .assert()
             .success()
-            .stderr(predicate::str::contains(
-                "Registered \"myproject\" to project registry",
-            ));
+            .stderr(predicate::str::contains("Registered").not());
 
-        // Project should now appear in grove list
         grove_cmd(&config_dir)
             .arg("list")
             .assert()
             .success()
-            .stdout(predicate::str::contains("myproject"));
+            .stdout(predicate::str::contains("No projects registered"));
+    }
+
+    /// Two grove processes registering different projects at the same time must
+    /// both survive: the registry write is lock-guarded and atomic, so neither
+    /// read-modify-write cycle can drop the other's entry.
+    #[test]
+    fn test_concurrent_auto_registration_keeps_both_projects() {
+        let config_dir = TempDir::new().unwrap();
+        let repos_dir = TempDir::new().unwrap();
+
+        let repos: Vec<_> = (0..6)
+            .map(|i| {
+                let repo = create_real_git_repo_with_commit(&repos_dir, &format!("proj{i}"));
+                write_grove_config(&repo, &format!("name = \"proj{i}\""));
+                repo
+            })
+            .collect();
+
+        let handles: Vec<_> = repos
+            .iter()
+            .map(|repo| {
+                let mut cmd = grove_cmd(&config_dir);
+                cmd.args(["env", "set", "FOO=bar"]).current_dir(repo);
+                std::thread::spawn(move || cmd.output().unwrap())
+            })
+            .collect();
+
+        for handle in handles {
+            let output = handle.join().unwrap();
+            assert!(output.status.success(), "grove env set failed: {output:?}");
+        }
+
+        let assert = grove_cmd(&config_dir).arg("list").assert().success();
+        let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+        for i in 0..6 {
+            assert!(
+                stdout.contains(&format!("proj{i}")),
+                "proj{i} missing from registry after concurrent registration:\n{stdout}"
+            );
+        }
     }
 }
 
