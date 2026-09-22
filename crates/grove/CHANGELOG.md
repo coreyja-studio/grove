@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0](https://github.com/coreyja-studio/grove/compare/v0.4.0...v0.5.0) (2026-09-22)
+
+
+### Features
+
+* add grove completions command for shell completion scripts ([#30](https://github.com/coreyja-studio/grove/issues/30)) ([cdea45c](https://github.com/coreyja-studio/grove/commit/cdea45c6da9257f21f79c58d63f469e52da5a5fc))
+* add grove update command ([#29](https://github.com/coreyja-studio/grove/issues/29)) ([e2a9c41](https://github.com/coreyja-studio/grove/commit/e2a9c4162aed019743ad693c34b080ffcf8ad601))
+
 ## [0.4.0](https://github.com/coreyja-studio/grove/compare/v0.3.0...v0.4.0) (2026-03-23)
 
 
