@@ -310,6 +310,11 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
 
     let result = (|| -> Result<()> {
         let mut file = File::create(&tmp_path)?;
+        // Replacing a restricted env file must not reset its permissions to
+        // the process umask default when the temp file is renamed into place.
+        if let Ok(metadata) = fs::metadata(path) {
+            file.set_permissions(metadata.permissions())?;
+        }
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
         drop(file);
@@ -740,6 +745,25 @@ fn shell_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("env.toml");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(&path, "new").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn test_shell_escape_simple() {
